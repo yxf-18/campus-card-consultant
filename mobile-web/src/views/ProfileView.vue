@@ -1,0 +1,7 @@
+<script setup lang="ts">
+import { useRouter } from 'vue-router'
+import { showConfirmDialog } from 'vant'
+import { useAuthStore } from '@/stores/auth'
+const store=useAuthStore();const router=useRouter()
+async function logout(){try{await showConfirmDialog({title:'退出登录',message:'确定退出当前账号吗？'});await store.logout();router.replace('/login')}catch{}}
+</script><template><div class="page profile-page"><header class="profile-hero"><div class="avatar">{{store.user?.nickname?.slice(0,1)||'访'}}</div><div><span class="eyebrow light">MY ACCOUNT</span><h1>{{store.user?.nickname||'游客'}}</h1><p>{{store.user?`@${store.user.username}`:'登录后保存问答记录'}}</p></div></header><template v-if="store.user"><section class="profile-card"><van-cell title="账号" :value="store.user.username"/><van-cell title="角色" :value="store.user.role==='ADMIN'?'管理员':'普通用户'"/><van-cell title="学号" :value="store.user.student_no||'未填写'"/><van-cell title="手机号" :value="store.user.phone||'未填写'"/><van-cell title="账号绑定" is-link value="修改手机号/学号" @click="router.push('/bind-account?redirect=/app/profile')"/></section><section class="privacy-card"><h3>隐私与安全</h3><p>系统仅保存完成咨询所需的账号信息、会话内容和反馈。涉及充值、挂失等操作时，本工具只提供办理指引，不直接执行账户操作。</p></section><van-button block round type="danger" plain @click="logout">退出登录</van-button></template><van-empty v-else description="请先登录"><van-button type="primary" round @click="router.push('/login')">去登录</van-button></van-empty></div></template>
