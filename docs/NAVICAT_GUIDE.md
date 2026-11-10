@@ -16,6 +16,7 @@ D:\AIProject\campus-card-consultant\backend-api\data\campus_card.db
 
 - `sys_user`：用户名、手机号、学号和角色
 - `campus_card_account`：校园卡号、余额和状态
+- `profile_change_request`：手机号/邮箱修改申请与审核结果
 - `knowledge_document`：知识文档及索引状态
 - `knowledge_chunk`：RAG 切片
 - `chat_session` / `chat_message` / `chat_citation`：会话与引用

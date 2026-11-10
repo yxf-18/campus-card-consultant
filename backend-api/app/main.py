@@ -15,8 +15,9 @@ from .database import SessionLocal, engine, init_db
 from .models import RagSyncTask
 from .responses import (ApiError, api_error_handler, fail, unhandled_error_handler,
                         validation_error_handler)
-from .routers import admin_categories, admin_documents, admin_ops, auth, chat, documents
+from .routers import admin_categories, admin_documents, admin_ops, auth, card, chat, documents
 from .seed import seed_database
+from .services import get_int_config, purge_expired_sessions
 
 settings = get_settings()
 
@@ -32,6 +33,8 @@ async def lifespan(_app: FastAPI):
             {RagSyncTask.status: "FAILED", RagSyncTask.error_message: "服务重启导致任务中断，可重试"},
             synchronize_session=False)
         db.commit()
+        # 已删除会话按配置的保留期做物理清理，避免过期问答内容长期滞留。
+        purge_expired_sessions(db, get_int_config(db, "chat.session_retention_days", 180))
     finally:
         db.close()
     yield
@@ -80,6 +83,7 @@ def health():
 
 
 app.include_router(auth.router, prefix=settings.api_prefix)
+app.include_router(card.router, prefix=settings.api_prefix)
 app.include_router(documents.router, prefix=settings.api_prefix)
 app.include_router(chat.router, prefix=settings.api_prefix)
 app.include_router(admin_categories.router, prefix=settings.api_prefix)

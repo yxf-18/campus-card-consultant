@@ -54,6 +54,26 @@ class CampusCardAccount(TimestampMixin, Base):
     __table_args__ = (Index("ix_card_status", "status"),)
 
 
+class ProfileChangeRequest(TimestampMixin, Base):
+    """手机号/邮箱修改申请：用户提交，管理员审核通过后才落到 sys_user。"""
+    __tablename__ = "profile_change_request"
+    id: Mapped[int] = mapped_column(IdType, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(IdType, ForeignKey("sys_user.id"), nullable=False)
+    field_name: Mapped[str] = mapped_column(String(20), nullable=False)
+    old_value: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    new_value: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    remark: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    reviewed_by: Mapped[int | None] = mapped_column(IdType, ForeignKey("sys_user.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (
+        CheckConstraint("field_name IN ('phone','email')", name="ck_profile_change_field"),
+        CheckConstraint("status IN ('PENDING','APPROVED','REJECTED')", name="ck_profile_change_status"),
+        Index("ix_profile_change_status_created", "status", "created_at"),
+        Index("ix_profile_change_user_field", "user_id", "field_name", "status"),
+    )
+
+
 class SysConfig(Base):
     __tablename__ = "sys_config"
     id: Mapped[int] = mapped_column(IdType, primary_key=True, autoincrement=True)

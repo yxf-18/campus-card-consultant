@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
-import re
 import uuid
 from collections import OrderedDict
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, timedelta
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
-from pydantic import BaseModel, Field, model_validator
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, model_validator
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -18,12 +16,14 @@ from ..config import get_settings
 from ..database import get_db
 from ..dependencies import require_admin, require_internal_token
 from ..models import (CampusCardAccount, ChatFeedback, ChatMessage, KnowledgeCategory,
-                      KnowledgeDocument, RagSyncTask, SysConfig, SysUser, now_local)
+                      KnowledgeDocument, ProfileChangeRequest, SysConfig, SysUser, now_local)
 from ..responses import ApiError, success
-from ..schemas import ConfigUpdateRequest, FeedbackHandleRequest, InternalToolRequest, UserStatusRequest
+from ..schemas import (ConfigUpdateRequest, FeedbackHandleRequest, InternalToolRequest,
+                       ProfileReviewRequest, UserStatusRequest)
 from ..security import create_download_token
 from ..services import (export_document_rows, export_feedback_rows, export_qa_rows,
-                        export_user_rows, get_config, run_sync_task)
+                        export_user_rows, get_config, identity_conflict, validate_config_value,
+                        visible_documents_query)
 from ..utils import fmt_dt, pagination
 
 router = APIRouter(prefix="/admin", tags=["后台-运营管理"])
@@ -70,43 +70,66 @@ def update_user_status(user_id: int, payload: UserStatusRequest, admin: SysUser 
     return success({"user": admin_user_json(user)})
 
 
-@router.get("/sync/tasks")
-def list_sync_tasks(status: str | None = None, document_id: int | None = None,
-                    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
-                    _admin: SysUser = Depends(require_admin), db: Session = Depends(get_db)):
-    query = db.query(RagSyncTask, KnowledgeDocument).join(
-        KnowledgeDocument, KnowledgeDocument.id == RagSyncTask.document_id)
+PROFILE_FIELD_LABELS = {"phone": "手机号", "email": "邮箱"}
+
+
+def profile_request_json(item: ProfileChangeRequest, user: SysUser) -> dict:
+    return {
+        "request_id": item.id, "user_id": item.user_id, "username": user.username,
+        "nickname": user.nickname, "student_no": user.student_no or "", "phone": user.phone or "",
+        "email": user.email or "", "field_name": item.field_name,
+        "field_label": PROFILE_FIELD_LABELS.get(item.field_name, item.field_name),
+        "old_value": item.old_value or "", "new_value": item.new_value, "status": item.status,
+        "remark": item.remark or "", "created_at": fmt_dt(item.created_at),
+        "reviewed_at": fmt_dt(item.reviewed_at),
+    }
+
+
+@router.get("/profile-requests")
+def list_profile_requests(status: str | None = None, keyword: str = "",
+                          page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+                          _admin: SysUser = Depends(require_admin), db: Session = Depends(get_db)):
+    query = (db.query(ProfileChangeRequest, SysUser)
+             .join(SysUser, SysUser.id == ProfileChangeRequest.user_id))
     if status:
-        query = query.filter(RagSyncTask.status == status)
-    if document_id is not None:
-        query = query.filter(RagSyncTask.document_id == document_id)
+        query = query.filter(ProfileChangeRequest.status == status)
+    if keyword.strip():
+        pattern = f"%{keyword.strip()}%"
+        query = query.filter(or_(SysUser.username.like(pattern), SysUser.nickname.like(pattern),
+                                 SysUser.student_no.like(pattern), SysUser.phone.like(pattern)))
     total = query.count()
-    rows = query.order_by(RagSyncTask.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
-    data = []
-    for task, doc in rows:
-        data.append({"task_id": task.id, "document_id": task.document_id, "document_title": doc.title,
-                     "task_type": task.task_type, "target_version": task.target_version,
-                     "status": task.status, "retry_count": task.retry_count,
-                     "chunk_count": task.chunk_count, "duration_ms": task.duration_ms,
-                     "error_message": task.error_message or "", "created_at": fmt_dt(task.created_at),
-                     "started_at": fmt_dt(task.started_at), "finished_at": fmt_dt(task.finished_at)})
-    return success({"list": data}, pagination(page, page_size, total))
+    rows = (query.order_by(ProfileChangeRequest.id.desc())
+            .offset((page - 1) * page_size).limit(page_size).all())
+    return success({"list": [profile_request_json(item, user) for item, user in rows]},
+                   pagination(page, page_size, total))
 
 
-@router.post("/sync/tasks/{task_id}/retry")
-def retry_sync_task(task_id: int, background_tasks: BackgroundTasks,
-                    _admin: SysUser = Depends(require_admin), db: Session = Depends(get_db)):
-    task = db.get(RagSyncTask, task_id)
-    if task is None or task.status != "FAILED":
-        raise ApiError(300104, "同步任务不存在或状态不允许重试", 400)
-    task.status = "PENDING"
-    task.retry_count += 1
-    task.error_message = None
-    task.started_at = None
-    task.finished_at = None
+@router.patch("/profile-requests/{request_id}")
+def review_profile_request(request_id: int, payload: ProfileReviewRequest,
+                           admin: SysUser = Depends(require_admin), db: Session = Depends(get_db)):
+    item = db.get(ProfileChangeRequest, request_id)
+    if item is None:
+        raise ApiError(100108, "资料变更申请不存在", 404)
+    if item.status != "PENDING":
+        raise ApiError(100109, "该申请已处理，不能重复审核", 400)
+    user = db.get(SysUser, item.user_id)
+    if user is None:
+        raise ApiError(100107, "用户不存在", 404)
+    if payload.status == "APPROVED":
+        label = PROFILE_FIELD_LABELS.get(item.field_name)
+        if label is None:
+            raise ApiError(100105, "不支持的资料字段", 400)
+        if identity_conflict(db, item.new_value, user.id):
+            raise ApiError(100104, f"{label}已被其他账号使用，无法通过审核", 409)
+        setattr(user, item.field_name, item.new_value)
+    item.status = payload.status
+    item.remark = payload.remark
+    item.reviewed_by = admin.id
+    item.reviewed_at = now_local()
     db.commit()
-    background_tasks.add_task(run_sync_task, task.id)
-    return success({"task_id": task.id, "status": task.status, "retry_count": task.retry_count})
+    db.refresh(item)
+    db.refresh(user)
+    return success({"request": profile_request_json(item, user)})
 
 
 @router.get("/feedbacks")
@@ -234,17 +257,10 @@ def update_config(config_key: str, payload: ConfigUpdateRequest,
     item = db.query(SysConfig).filter(SysConfig.config_key == config_key).first()
     if item is None:
         raise ApiError(100105, "配置键不在白名单内", 400)
-    value = payload.config_value
-    if item.value_type == "INT":
-        if not re.fullmatch(r"\d+", value):
-            raise ApiError(100105, "该配置必须为整数", 400)
-    elif item.value_type == "BOOL" and value.lower() not in {"true", "false", "0", "1"}:
-        raise ApiError(100105, "该配置必须为布尔值", 400)
-    elif item.value_type == "JSON":
-        try:
-            json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ApiError(100105, "该配置必须为合法JSON", 400) from exc
+    try:
+        value = validate_config_value(config_key, item.value_type, payload.config_value)
+    except ValueError as exc:
+        raise ApiError(100105, str(exc), 400) from exc
     item.config_value = value
     if payload.remark is not None:
         item.description = payload.remark
@@ -338,15 +354,15 @@ def internal_tool_query(payload: InternalToolRequest, _: None = Depends(require_
                            "source": "本地校园卡账户数据库"}}
     if payload.tool_name == "find_documents":
         keyword = str(payload.params.get("keyword", "")).strip()
-        query = db.query(KnowledgeDocument).filter(KnowledgeDocument.is_deleted.is_(False),
-                                                    KnowledgeDocument.status == "PUBLISHED")
+        query = visible_documents_query(db)
         if keyword:
             pattern = f"%{keyword}%"
             query = query.filter(or_(KnowledgeDocument.title.like(pattern),
-                                     KnowledgeDocument.summary.like(pattern)))
-        docs = query.order_by(KnowledgeDocument.id).limit(10).all()
+                                     KnowledgeDocument.summary.like(pattern),
+                                     KnowledgeDocument.keywords.like(pattern)))
+        rows = query.order_by(KnowledgeDocument.id).limit(10).all()
         return {"result": [{"document_id": doc.id, "title": doc.title,
-                            "summary": doc.summary or ""} for doc in docs]}
+                            "summary": doc.summary or ""} for doc, _category in rows]}
     if payload.tool_name == "list_categories":
         categories = db.query(KnowledgeCategory).filter(KnowledgeCategory.status == "ENABLED").order_by(
             KnowledgeCategory.sort_order).all()

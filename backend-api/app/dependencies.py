@@ -52,7 +52,7 @@ def require_admin(user: SysUser = Depends(get_current_user)) -> SysUser:
 
 def require_mobile_user(user: SysUser = Depends(get_current_user)) -> SysUser:
     if user.role != "USER":
-        raise ApiError(100201, "管理员不能使用移动端问答功能", 403)
+        raise ApiError(100201, "管理员不能使用移动端功能", 403)
     return user
 
 

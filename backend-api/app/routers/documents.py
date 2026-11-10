@@ -11,37 +11,29 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..database import get_db
 from ..dependencies import get_current_user
-from ..models import KnowledgeCategory, KnowledgeDocument, SysUser, now_local
+from ..models import KnowledgeCategory, KnowledgeDocument, SysUser
 from ..responses import ApiError, success
 from ..security import decode_download_token
-from ..services import document_json, make_download_url
+from ..services import (document_json, get_int_config, is_document_visible,
+                        make_download_url, visible_documents_query)
 from ..utils import fmt_dt, pagination
 
 router = APIRouter(tags=["首页与文档"])
 settings = get_settings()
 
 
-def visible_query(db: Session):
-    today = now_local().date()
-    return (db.query(KnowledgeDocument, KnowledgeCategory)
-            .join(KnowledgeCategory, KnowledgeCategory.id == KnowledgeDocument.category_id)
-            .filter(KnowledgeCategory.status == "ENABLED", KnowledgeDocument.status == "PUBLISHED",
-                    KnowledgeDocument.is_deleted.is_(False),
-                    or_(KnowledgeDocument.effective_date.is_(None), KnowledgeDocument.effective_date <= today),
-                    or_(KnowledgeDocument.expire_date.is_(None), KnowledgeDocument.expire_date >= today)))
-
-
 @router.get("/home/categories")
-def home_categories(category_id: int | None = None, limit: int = Query(default=5, ge=1, le=20),
+def home_categories(category_id: int | None = None, limit: int | None = Query(default=None, ge=1, le=20),
                     with_empty: bool = False, _user: SysUser = Depends(get_current_user),
                     db: Session = Depends(get_db)):
+    limit = limit or get_int_config(db, "home.documents_limit", 5)
     categories = db.query(KnowledgeCategory).filter(KnowledgeCategory.status == "ENABLED")
     if category_id is not None:
         categories = categories.filter(KnowledgeCategory.id == category_id)
     categories = categories.order_by(KnowledgeCategory.sort_order, KnowledgeCategory.id).all()
     result = []
     for category in categories:
-        docs = (visible_query(db).filter(KnowledgeDocument.category_id == category.id)
+        docs = (visible_documents_query(db).filter(KnowledgeDocument.category_id == category.id)
                 .order_by(KnowledgeDocument.sort_order, KnowledgeDocument.published_at.desc()).limit(limit).all())
         if not docs and not with_empty:
             continue
@@ -59,7 +51,7 @@ def home_categories(category_id: int | None = None, limit: int = Query(default=5
 def search_documents(keyword: str = "", category_id: int | None = None, sort: str = "latest",
                      page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
                      _user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    query = visible_query(db)
+    query = visible_documents_query(db)
     if keyword.strip():
         pattern = f"%{keyword.strip()}%"
         query = query.filter(or_(KnowledgeDocument.title.like(pattern), KnowledgeDocument.summary.like(pattern),
@@ -78,27 +70,31 @@ def search_documents(keyword: str = "", category_id: int | None = None, sort: st
 
 @router.get("/documents/{document_id}")
 def get_document(document_id: int, _user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    row = visible_query(db).filter(KnowledgeDocument.id == document_id).first()
+    row = visible_documents_query(db).filter(KnowledgeDocument.id == document_id).first()
     if row is None:
         raise ApiError(200104, "文档不存在或已下架", 404)
     doc, category = row
     doc.view_count += 1
+    ttl = get_int_config(db, "download.url_ttl_seconds", 300)
     db.commit()
     data = document_json(doc)
     data.update({"category_name": category.name, "content": doc.parsed_text or "",
-                 "download_url": make_download_url(doc.id) if doc.allow_download else ""})
+                 "download_url": make_download_url(doc.id, ttl) if doc.allow_download else "",
+                 "download_expires_in": ttl})
     return success({"document": data})
 
 
 @router.get("/documents/{document_id}/download")
 def get_download(document_id: int, _user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    row = visible_query(db).filter(KnowledgeDocument.id == document_id).first()
+    row = visible_documents_query(db).filter(KnowledgeDocument.id == document_id).first()
     if row is None:
         raise ApiError(200104, "文档不存在或已下架", 404)
     doc = row[0]
     if not doc.allow_download:
         raise ApiError(200105, "该文档未开放下载", 403)
-    return success({"file_url": make_download_url(document_id), "file_name": doc.file_name, "expires_in": 300})
+    ttl = get_int_config(db, "download.url_ttl_seconds", 300)
+    return success({"file_url": make_download_url(document_id, ttl), "file_name": doc.file_name,
+                    "expires_in": ttl})
 
 
 @router.get("/files/download/{token}")
@@ -107,11 +103,14 @@ def download_file(token: str, db: Session = Depends(get_db)):
         object_id = decode_download_token(token, "document")
     except jwt.PyJWTError as exc:
         raise ApiError(200104, "下载地址无效或已过期", 403) from exc
-    doc = db.get(KnowledgeDocument, int(object_id))
-    today = now_local().date()
-    if (doc is None or doc.is_deleted or doc.status != "PUBLISHED" or not doc.allow_download
-            or (doc.effective_date and doc.effective_date > today)
-            or (doc.expire_date and doc.expire_date < today)):
+    row = (db.query(KnowledgeDocument, KnowledgeCategory)
+           .join(KnowledgeCategory, KnowledgeCategory.id == KnowledgeDocument.category_id)
+           .filter(KnowledgeDocument.id == int(object_id)).first())
+    if row is None:
+        raise ApiError(200104, "文档不存在或不可下载", 404)
+    doc, category = row
+    # 下载令牌可能早于分类停用/文档过期签发，落盘前必须重新校验可见性。
+    if not is_document_visible(doc, category) or not doc.allow_download:
         raise ApiError(200104, "文档不存在或不可下载", 404)
     path = (settings.upload_dir / Path(doc.storage_path).name).resolve()
     if not path.exists():

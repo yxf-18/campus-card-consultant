@@ -27,7 +27,7 @@ onBeforeUnmount(() => { window.removeEventListener('resize', resize); chart?.dis
 </script>
 <template>
   <div v-loading="loading" class="page-stack">
-    <div class="hero-card"><div><span class="eyebrow">运营总览</span><h2>知识内容运营状态</h2><p>关注问答依据、同步结果与用户反馈，持续维护可信知识。</p></div><div class="filter-bar"><el-button type="primary" plain @click="load">刷新数据</el-button><el-button @click="exportCsv">导出问答CSV</el-button></div></div>
+    <div class="hero-card"><div><span class="eyebrow">运营总览</span><h2>知识内容运营状态</h2><p>关注问答效果、知识内容与用户反馈，持续维护可信知识。</p></div><div class="filter-bar"><el-button type="primary" plain @click="load">刷新数据</el-button><el-button @click="exportCsv">导出问答CSV</el-button></div></div>
     <div class="metric-grid"><article class="metric-card"><span>用户总数</span><strong>{{ metrics.user.total || 0 }}</strong><small>近30天新增 {{ metrics.user.new || 0 }}</small></article><article class="metric-card mint"><span>已发布文档</span><strong>{{ metrics.document.published || 0 }}</strong><small>文档总数 {{ metrics.document.total || 0 }}</small></article><article class="metric-card violet"><span>问答量</span><strong>{{ metrics.qa.total || 0 }}</strong><small>有依据 {{ metrics.qa.answered || 0 }}</small></article><article class="metric-card amber"><span>待处理反馈</span><strong>{{ metrics.feedback.pending || 0 }}</strong><small>点赞 {{ metrics.feedback.like || 0 }} · 点踩 {{ metrics.feedback.dislike || 0 }}</small></article></div>
     <div class="panel"><div class="panel-head"><div><h3>近30天趋势</h3><p>用户活跃与提问变化</p></div></div><div ref="chartEl" class="chart"></div></div>
   </div>

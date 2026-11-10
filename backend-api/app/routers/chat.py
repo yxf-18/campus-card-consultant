@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -18,8 +19,9 @@ from ..models import (ChatCitation, ChatFeedback, ChatMessage, ChatSession, Know
                        KnowledgeChunk, KnowledgeDocument, SysUser, now_local)
 from ..responses import ApiError, success
 from ..schemas import ChatRequest, FeedbackRequest, SessionCreateRequest, SessionUpdateRequest
-from ..services import (allowed_versions_for, build_context, get_config, get_float_config,
-                        get_int_config, is_document_visible, local_retrieve)
+from ..services import (ACCOUNT_ACTION_PHRASES, allowed_versions_for, build_context,
+                        get_bool_config, get_config, get_float_config, get_int_config,
+                        is_document_visible, local_retrieve, sensitive_reminder)
 from ..utils import default_suggestions, fmt_dt, pagination
 
 router = APIRouter(prefix="/chat", tags=["AI问答与会话"])
@@ -138,18 +140,39 @@ def dedupe_citations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result[:10]
 
 
+def clean_snippet(value: Any, title: str = "", limit: int = 220) -> str:
+    """切片里常带 Markdown 标题，回答时去掉标题行和重复标题，只保留正文。"""
+    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
+    if len(lines) > 1 and re.fullmatch(r"#{1,6}\s*.*", lines[0]):
+        lines = lines[1:]
+    text = " ".join(re.sub(r"^#{1,6}\s*", "", line) for line in lines)
+    text = " ".join(text.split())
+    if title and text.startswith(title):
+        text = text[len(title):].lstrip(" ：:，,。.、")
+    return text[:limit]
+
+
 def local_answer(question: str, contexts: list[dict[str, Any]]) -> str:
-    if any(phrase in question for phrase in ("帮我充值", "替我充值", "帮我挂失", "替我挂失", "冻结我的卡", "解冻我的卡")):
+    if any(phrase in question for phrase in ACCOUNT_ACTION_PHRASES):
         return ("本工具只能提供咨询与办理指引，不能直接执行充值、挂失、解冻、退款等账户操作。"
                 "请通过学校正式服务渠道办理，并注意保护密码和验证码。")
     if not contexts:
         return ("暂未在知识库中找到足够依据。请补充问题，或联系校园卡服务中心等学校正式渠道；"
                 "本回答不构成业务办理承诺。")
-    parts = ["根据已入库资料，整理如下："]
-    for index, context in enumerate(contexts[:3], start=1):
-        snippet = (context.get("snippet") or "").strip().replace("\n", " ")
-        parts.append(f"{index}. {context.get('title', '相关资料')}：{snippet[:220]}")
-    parts.append("以上为咨询指引，具体办理要求请以学校最新正式通知为准。")
+    parts = ["根据学校公开的校园卡资料，可以这样处理："]
+    seen_titles: set[str] = set()
+    for context in contexts:
+        title = (context.get("title") or "相关资料").strip()
+        if title in seen_titles:
+            continue
+        snippet = clean_snippet(context.get("snippet") or "", title)
+        if not snippet:
+            continue
+        seen_titles.add(title)
+        parts.append(f"- {title}：{snippet}")
+        if len(seen_titles) >= 3:
+            break
+    parts.append("以上内容仅供参考，具体办理要求请以学校最新正式通知为准。")
     return "\n\n".join(parts)
 
 
@@ -188,11 +211,18 @@ def persist_answer(assistant_id: int, status: str, content: str, citations: list
             session.last_message_at = now_local()
             total_questions = db.query(ChatMessage).filter(ChatMessage.session_id == session.id,
                                                            ChatMessage.role == "USER").count()
-            max_turns = get_int_config(db, "chat.history_turns", 10)
-            if total_questions > max_turns:
-                recent = db.query(ChatMessage).filter(ChatMessage.session_id == session.id,
-                                                       ChatMessage.role == "USER").order_by(ChatMessage.id.desc()).limit(8).all()
-                session.context_summary = "；".join(item.content[:80] for item in reversed(recent))
+            max_turns = max(1, get_int_config(db, "chat.history_turns", 10))
+            # 只有跨过整轮窗口才刷新摘要：旧实现每问一句就覆盖成最近 8 个问题，
+            # 既丢失更早上下文，也把“摘要”变成了问题列表。
+            if total_questions > max_turns and total_questions % max_turns == 0:
+                recent = (db.query(ChatMessage)
+                          .filter(ChatMessage.session_id == session.id, ChatMessage.status == "SUCCESS",
+                                  ChatMessage.role.in_(["USER", "ASSISTANT"]))
+                          .order_by(ChatMessage.id.desc()).limit(max_turns).all())
+                lines = [f"{'问' if item.role == 'USER' else '答'}：{(item.content or '')[:80]}"
+                         for item in reversed(recent) if item.content]
+                if lines:
+                    session.context_summary = "；".join(lines)[-1200:]
         db.commit()
         return saved
     finally:
@@ -218,9 +248,9 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
             contexts = await ai_client.retrieve(question, versions, top_k, threshold, document_id)
             model_name = "ai-service-rag"
         except Exception:
-            contexts = local_retrieve(db, question, versions, top_k, document_id)
+            contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
         if not contexts:
-            contexts = local_retrieve(db, question, versions, top_k, document_id)
+            contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
         fallback_citations = [citation_from_context(db, item) for item in contexts]
         if contexts or enable_web or enable_db_tool:
             payload = {
@@ -268,8 +298,12 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
             content = local_answer(question, contexts)
             async for event, data in stream_local_answer(content):
                 yield event, data
+        reminder = sensitive_reminder(db, question)
+        if reminder:
+            content = f"{content}\n\n{reminder}"
+            yield "delta", {"content": "\n\n" + reminder}
         grounded = grounded or bool(citations)
-        suggestions = [item for item in suggestions if item.strip()][:3] or default_suggestions(question)
+        suggestions = list(dict.fromkeys(item for item in suggestions if item.strip()))[:3] or default_suggestions(question)
         yield "suggestion", {"suggestions": suggestions}
         saved = persist_answer(assistant_id, "SUCCESS", content, citations, suggestions,
                                grounded, model_name, started)
@@ -308,6 +342,7 @@ async def send_message(payload: ChatRequest, user: SysUser = Depends(require_mob
             raise ApiError(200104, "当前文档不存在或不可访问", 404)
     max_chars = get_int_config(db, "chat.context_max_chars", 6000)
     max_turns = get_int_config(db, "chat.history_turns", 10)
+    enable_web = payload.enable_web and get_bool_config(db, "web.enabled", True)
     history = build_context(db, session, max_chars, max_turns)
     if session.title == "新的咨询":
         session.title = payload.question.strip()[:20] or "新的咨询"
@@ -324,7 +359,7 @@ async def send_message(payload: ChatRequest, user: SysUser = Depends(require_mob
     session_id = session.id
     assistant_id = assistant.id
     generator = run_generation(assistant_id, session_id, question.content, payload.document_id,
-                               payload.enable_web, payload.enable_db_tool, history,
+                               enable_web, payload.enable_db_tool, history,
                                {"user_id": user.id, "role": user.role,
                                 "student_no": user.student_no or ""})
     if payload.stream:

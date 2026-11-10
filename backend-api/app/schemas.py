@@ -4,95 +4,122 @@ import re
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-
-
-class RegisterRequest(BaseModel):
-    username: str = Field(min_length=4, max_length=32, pattern=r"^[A-Za-z0-9_]+$")
-    password: str = Field(min_length=8, max_length=32)
-    phone: str | None = Field(default=None, max_length=11)
-    email: str | None = Field(default=None, max_length=64)
-    student_no: str | None = Field(default=None, max_length=32)
-    nickname: str | None = Field(default=None, max_length=32)
-    privacy_agreed: bool
-
-    @field_validator("password")
-    @classmethod
-    def validate_password(cls, value: str) -> str:
-        if not re.search(r"[A-Za-z]", value) or not re.search(r"\d", value):
-            raise ValueError("密码必须同时包含字母和数字")
-        return value
-
-    @field_validator("phone")
-    @classmethod
-    def validate_phone(cls, value: str | None) -> str | None:
-        if value and not re.fullmatch(r"1\d{10}", value):
-            raise ValueError("手机号格式不正确")
-        return value
-
-    @field_validator("email")
-    @classmethod
-    def validate_email(cls, value: str | None) -> str | None:
-        if value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
-            raise ValueError("邮箱格式不正确")
-        return value
-
-    @model_validator(mode="after")
-    def validate_privacy(self):
-        if not self.privacy_agreed:
-            raise ValueError("必须同意隐私协议")
-        return self
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
     account: str = Field(min_length=1, max_length=64)
-    password: str = Field(min_length=8, max_length=32)
+    password: str = Field(min_length=1, max_length=64)
     login_type: Literal["USERNAME", "PHONE", "EMAIL", "STUDENT_NO"] | None = None
     client_type: Literal["MOBILE", "ADMIN"] | None = None
     redirect_url: str | None = Field(default=None, max_length=500)
 
 
-class ProfileBindRequest(BaseModel):
-    phone: str = Field(min_length=11, max_length=11)
-    student_no: str = Field(min_length=1, max_length=32)
+class ProfileUpdateRequest(BaseModel):
+    phone: str | None = Field(default=None, max_length=11)
+    student_no: str | None = Field(default=None, max_length=32)
     nickname: str | None = Field(default=None, max_length=32)
     email: str | None = Field(default=None, max_length=64)
 
     @field_validator("phone")
     @classmethod
-    def validate_bind_phone(cls, value: str) -> str:
+    def validate_phone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("手机号不能为空")
         if not re.fullmatch(r"1\d{10}", value):
             raise ValueError("手机号格式不正确")
         return value
 
     @field_validator("email")
     @classmethod
-    def validate_bind_email(cls, value: str | None) -> str | None:
-        if value and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+    def validate_email(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
             raise ValueError("邮箱格式不正确")
         return value
+
+    @field_validator("student_no")
+    @classmethod
+    def validate_student_no(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("学号不能为空")
+        return value
+
+    @field_validator("nickname")
+    @classmethod
+    def validate_nickname(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ProfileReviewRequest(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+    remark: str | None = Field(default=None, max_length=500)
 
 
 class SessionCreateRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=100)
 
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("会话标题不能为空")
+        return cleaned
+
 
 class SessionUpdateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("会话标题不能为空")
+        return cleaned
 
 
 class FeedbackRequest(BaseModel):
     rating: Literal["LIKE", "DISLIKE"]
     reason: str | None = Field(default=None, max_length=500)
 
+    @field_validator("reason")
+    @classmethod
+    def strip_reason(cls, value: str | None) -> str | None:
+        return value.strip() if value else value
+
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
-    session_id: int | None = None
-    document_id: int | None = None
+    session_id: int | None = Field(default=None, gt=0)
+    document_id: int | None = Field(default=None, gt=0)
     enable_web: bool = True
     enable_db_tool: bool = True
     stream: bool = True
+
+    @field_validator("question")
+    @classmethod
+    def validate_question(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("问题不能为空")
+        return cleaned
 
 
 class CategoryCreateRequest(BaseModel):

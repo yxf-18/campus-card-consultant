@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..dependencies import require_admin
-from ..models import KnowledgeCategory, KnowledgeChunk, KnowledgeDocument, RagSyncTask, SysUser, now_local
+from ..models import KnowledgeCategory, KnowledgeChunk, KnowledgeDocument, SysUser, now_local
 from ..responses import ApiError, success
 from ..schemas import DocumentStatusRequest
 from ..services import document_json, get_int_config, run_sync_task, save_upload, trigger_sync
@@ -26,6 +26,18 @@ def parse_date(value: str | None) -> date | None:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError as exc:
         raise ApiError(100105, "日期格式应为YYYY-MM-DD", 400) from exc
+
+
+def validate_period(effective: date | None, expire: date | None) -> None:
+    if effective and expire and effective > expire:
+        raise ApiError(100105, "生效日期不得晚于失效日期", 400)
+
+
+def ensure_publishable(doc: KnowledgeDocument, category: KnowledgeCategory | None) -> None:
+    if category is None or category.status != "ENABLED":
+        raise ApiError(200106, "所属分类已停用，不能发布", 400)
+    if doc.expire_date and doc.expire_date < now_local().date():
+        raise ApiError(100105, "文档已过失效日期，不能发布", 400)
 
 
 async def read_upload(file: UploadFile, max_mb: int) -> tuple[bytes, str, str]:
@@ -90,6 +102,15 @@ async def create_document(background_tasks: BackgroundTasks, file: UploadFile = 
         raise ApiError(200106, "分类不存在或已停用", 400)
     if status_value not in {"DRAFT", "PUBLISHED"}:
         raise ApiError(100105, "新建文档状态只能为DRAFT或PUBLISHED", 400)
+    title = title.strip()
+    if not title:
+        raise ApiError(100105, "文档标题不能为空", 400)
+    # 先校验日期再落盘，避免校验失败后在上传目录里留下孤儿文件。
+    effective = parse_date(effective_date)
+    expired = parse_date(expire_date)
+    validate_period(effective, expired)
+    if status_value == "PUBLISHED" and expired and expired < now_local().date():
+        raise ApiError(100105, "失效日期早于今天，不能直接发布", 400)
     max_mb = get_int_config(db, "upload.max_size_mb", 20)
     content, file_name, file_type = await read_upload(file, max_mb)
     path, digest = save_upload(content, file_name)
@@ -97,7 +118,7 @@ async def create_document(background_tasks: BackgroundTasks, file: UploadFile = 
         category_id=category_id, title=title, summary=summary, keywords=keywords,
         file_name=file_name, storage_path=path.name, file_type=file_type, file_size=len(content),
         file_hash=digest, source_department=source, document_no=document_no,
-        effective_date=parse_date(effective_date), expire_date=parse_date(expire_date),
+        effective_date=effective, expire_date=expired,
         status=status_value, sync_status="NOT_INDEXED", allow_download=allow_download,
         sort_order=sort_order, published_at=now_local() if status_value == "PUBLISHED" else None,
         created_by=admin.id, updated_by=admin.id)
@@ -130,11 +151,24 @@ async def update_document(document_id: int, background_tasks: BackgroundTasks,
     if doc is None or doc.is_deleted:
         raise ApiError(200104, "文档不存在", 404)
     if title is not None:
+        title = title.strip()
+        if not title:
+            raise ApiError(100105, "文档标题不能为空", 400)
+    # 先校验日期再落盘，避免校验失败后留下孤儿文件。
+    effective = parse_date(effective_date) if effective_date is not None else doc.effective_date
+    expired = parse_date(expire_date) if expire_date is not None else doc.expire_date
+    validate_period(effective, expired)
+    if expire_date is not None and doc.status == "PUBLISHED" and expired and expired < now_local().date():
+        raise ApiError(100105, "失效日期早于今天，请先下架文档或调整失效日期", 400)
+    content_changed = False
+    if title is not None:
+        content_changed = content_changed or title != doc.title
         doc.title = title
     if category_id is not None:
         category = db.get(KnowledgeCategory, category_id)
         if category is None or category.status != "ENABLED":
             raise ApiError(200106, "分类不存在或已停用", 400)
+        content_changed = content_changed or category_id != doc.category_id
         doc.category_id = category_id
     if summary is not None:
         doc.summary = summary
@@ -145,9 +179,9 @@ async def update_document(document_id: int, background_tasks: BackgroundTasks,
     if document_no is not None:
         doc.document_no = document_no
     if effective_date is not None:
-        doc.effective_date = parse_date(effective_date)
+        doc.effective_date = effective
     if expire_date is not None:
-        doc.expire_date = parse_date(expire_date)
+        doc.expire_date = expired
     if allow_download is not None:
         doc.allow_download = allow_download
     if sort_order is not None:
@@ -158,16 +192,21 @@ async def update_document(document_id: int, background_tasks: BackgroundTasks,
         path, digest = save_upload(content, file_name)
         doc.file_name, doc.storage_path, doc.file_type = file_name, path.name, file_type
         doc.file_size, doc.file_hash = len(content), digest
+        content_changed = True
         if file_type in {"TXT", "MD"}:
             try:
                 doc.parsed_text = content.decode("utf-8")
             except UnicodeDecodeError:
                 doc.parsed_text = content.decode("gb18030", errors="ignore")
+        else:
+            # PDF/DOCX 的正文要等重新索引后由 AI 服务回填，不能继续沿用旧文件正文。
+            doc.parsed_text = None
     doc.updated_by = admin.id
     db.commit()
     db.refresh(doc)
     task_id = None
-    if doc.status == "PUBLISHED":
+    # 只有标题、分类或原始文件变化才影响向量索引；改摘要、排序、下载开关不应制造新版本。
+    if doc.status == "PUBLISHED" and content_changed:
         task = trigger_sync(db, doc, "UPDATE", admin.id)
         task_id = task.id
         background_tasks.add_task(run_sync_task, task.id)
@@ -177,6 +216,8 @@ async def update_document(document_id: int, background_tasks: BackgroundTasks,
 def change_status(doc: KnowledgeDocument, target: str, admin: SysUser, db: Session,
                   background_tasks: BackgroundTasks) -> int | None:
     old = doc.status
+    if target == "PUBLISHED" and old != "PUBLISHED":
+        ensure_publishable(doc, db.get(KnowledgeCategory, doc.category_id))
     doc.status = target
     doc.updated_by = admin.id
     if target == "PUBLISHED" and not doc.published_at:

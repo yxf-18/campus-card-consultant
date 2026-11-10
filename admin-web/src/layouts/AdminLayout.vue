@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { DataAnalysis, Document, FolderOpened, Refresh, User, Warning, Setting, SwitchButton } from '@element-plus/icons-vue'
+import { DataAnalysis, Document, FolderOpened, User, Warning, Setting, SwitchButton, EditPen } from '@element-plus/icons-vue'
 const route = useRoute()
 const router = useRouter()
 const store = useAuthStore()
@@ -16,7 +16,7 @@ async function logout() { await store.logout(); router.push('/login') }
         <el-menu-item index="/console/categories"><el-icon><FolderOpened /></el-icon>分类管理</el-menu-item>
         <el-menu-item index="/console/documents"><el-icon><Document /></el-icon>文档管理</el-menu-item>
         <el-menu-item index="/console/users"><el-icon><User /></el-icon>用户管理</el-menu-item>
-        <el-menu-item index="/console/sync-tasks"><el-icon><Refresh /></el-icon>同步任务</el-menu-item>
+        <el-menu-item index="/console/profile-requests"><el-icon><EditPen /></el-icon>资料审核</el-menu-item>
         <el-menu-item index="/console/feedbacks"><el-icon><Warning /></el-icon>反馈处理</el-menu-item>
         <el-menu-item index="/console/configs"><el-icon><Setting /></el-icon>系统配置</el-menu-item>
       </el-menu>

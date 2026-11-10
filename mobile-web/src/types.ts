@@ -7,3 +7,5 @@ export interface DocumentDetail extends DocCard{content:string;source_department
 export interface Citation{citation_id?:number;source_type:string;document_id?:number;title:string;source_url?:string;snippet?:string;page_no?:number;tool_name?:string;sort_order?:number}
 export interface ChatMessage{message_id?:number;role:'USER'|'ASSISTANT';content:string;status?:string;citations?:Citation[];suggestions?:string[];feedback?:{rating:string;status:string};is_grounded?:boolean;created_at?:string}
 export interface Session{exsession_id?:number;session_id:number;title:string;last_message_at:string;message_count?:number;status?:string}
+export interface CardAccount{card_no:string;balance:string;status:string;last_transaction_at?:string}
+export interface ProfileChangeRequest{request_id:number;field_name:'phone'|'email';field_label:string;old_value:string;new_value:string;status:'PENDING'|'APPROVED'|'REJECTED';remark:string;created_at:string;reviewed_at:string}

@@ -12,7 +12,8 @@ import httpx
 from .config import get_settings
 
 settings = get_settings()
-SAFE_REFUSAL_PHRASES = ("帮我充值", "替我充值", "帮我挂失", "替我挂失", "冻结我的卡", "解冻我的卡", "帮我退款")
+SAFE_REFUSAL_PHRASES = ("帮我充值", "替我充值", "帮我挂失", "替我挂失", "冻结我的卡", "解冻我的卡",
+                        "帮我退款", "替我退款")
 
 
 def parse_so_results(page: str) -> list[dict[str, Any]]:
@@ -152,6 +153,13 @@ async def core_tool(question: str, user_context: dict[str, Any] | None = None,
                                          headers={"X-Internal-Token": settings.internal_token},
                                          json={"tool_name": tool_name, "params": params or {},
                                                "user_context": user_context or {}})
+        if response.status_code in {401, 403}:
+            try:
+                message = response.json().get("message") or "没有权限查询该校园卡账户"
+            except Exception:
+                message = "没有权限查询该校园卡账户"
+            return {"tool_name": tool_name,
+                    "result": {"found": False, "denied": True, "message": message}}
         response.raise_for_status()
         return {"tool_name": tool_name, "result": response.json().get("result")}
     except Exception:
@@ -165,6 +173,82 @@ def safe_refusal(question: str) -> str | None:
     return None
 
 
+CARD_STATUS_TEXT = {"ACTIVE": "账户状态正常", "FROZEN": "账户已冻结", "LOST": "账户已挂失",
+                    "DISABLED": "账户已停用", "INACTIVE": "账户尚未激活"}
+
+
+def _clip(text: object, limit: int = 220) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip("，。；、,; ") + "……"
+
+
+def _clean_snippet(value: object, limit: int = 220, title: str = "") -> str:
+    """去掉切片自带的 Markdown 标题行，避免气泡里出现 “## 挂失” 或标题重复。"""
+    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
+    if len(lines) > 1 and re.fullmatch(r"#{1,6}\s*.*", lines[0]):
+        lines = lines[1:]
+    text = " ".join(re.sub(r"^#{1,6}\s*", "", line) for line in lines)
+    text = re.sub(r"\s+", " ", text).strip()
+    if title and text.startswith(title):
+        text = text[len(title):].lstrip(" ：:，,。.、")
+    return _clip(text, limit)
+
+
+def _amount(value: object) -> str:
+    text = str(value if value is not None else "").strip()
+    return f"{text} 元" if text else "金额暂未显示"
+
+
+def _dict_to_text(data: dict) -> str:
+    """把配置型返回值摊平成「标题：内容」的短句，避免把 JSON 直接显示给用户。"""
+    chunks: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, (list, tuple)):
+            items = []
+            for item in value:
+                if isinstance(item, dict):
+                    items.append(str(item.get("name") or item.get("title") or "").strip())
+                else:
+                    items.append(str(item).strip())
+            items = [item for item in items if item]
+            if items:
+                chunks.append(f"{key}：" + "、".join(_clip(item, 40) for item in items[:6]))
+        elif isinstance(value, dict):
+            nested = "，".join(f"{sub_key} {_clip(sub_value, 40)}"
+                               for sub_key, sub_value in value.items() if sub_value not in (None, ""))
+            if nested:
+                chunks.append(f"{key}：{nested}")
+        elif value not in (None, ""):
+            chunks.append(f"{key}：{_clip(value, 60)}")
+    return "；".join(chunks) + "。" if chunks else ""
+
+
+def describe_tool_result(tool_name: str, result: Any) -> str:
+    """把内部数据库工具的结果翻译成一句人话，绝不把原始参数原样丢给用户。"""
+    if isinstance(result, list):
+        titles = [str(item.get("title") or item.get("name") or "").strip()
+                  for item in result if isinstance(item, dict)]
+        titles = [item for item in titles if item]
+        if not titles:
+            return "本地数据库暂时没有可展示的记录。"
+        return "本地数据库里可以找到这些内容：" + "、".join(titles[:5]) + "。"
+    if not isinstance(result, dict):
+        return _clip(result)
+    if result.get("found") is False:
+        return str(result.get("message") or "本地数据库没有查询到对应记录，请核对信息或联系学校卡务中心。")
+    if tool_name == "get_card_balance":
+        parts = [f"你当前的校园卡余额为 {_amount(result.get('balance'))}"]
+        if result.get("card_no"):
+            parts.append(f"卡号 {result['card_no']}")
+        status = str(result.get("status") or "").upper()
+        if status:
+            parts.append(CARD_STATUS_TEXT.get(status, "账户状态请以卡务中心登记为准"))
+        return "，".join(parts) + "。该结果来自学校校园卡账户数据库，只支持查询本人账户。"
+    return _dict_to_text(result)
+
+
 def build_answer(question: str, contexts: list[dict], web_results: list[dict],
                  tool_result: dict | None) -> str:
     refusal = safe_refusal(question)
@@ -175,27 +259,59 @@ def build_answer(question: str, contexts: list[dict], web_results: list[dict],
                 "本工具不会编造政策、金额或办理时限。")
     parts: list[str] = []
     if contexts:
-        parts.append("根据知识库资料整理如下：")
-        for index, item in enumerate(contexts[:3], start=1):
-            parts.append(f"{index}. {item.get('title', '相关资料')}：{str(item.get('snippet', ''))[:260]}")
-    if tool_result and tool_result.get("result"):
-        result = tool_result["result"]
-        result_text = json.dumps(result, ensure_ascii=False)[:500] if isinstance(result, (dict, list)) else str(result)[:500]
-        parts.append("本地校园卡账户数据库查询结果：" if tool_result.get("tool_name") == "get_card_balance" else "本地数据库查询结果：")
-        parts.append(result_text)
+        parts.append("根据学校公开的校园卡资料，可以这样处理：")
+        seen_titles: set[str] = set()
+        for item in contexts:
+            title = _clip(item.get("title") or "相关资料", 40)
+            if title in seen_titles:
+                continue
+            snippet = _clean_snippet(item.get("snippet") or "", 220, title)
+            if not snippet:
+                continue
+            seen_titles.add(title)
+            parts.append(f"- {title}：{snippet}")
+            if len(seen_titles) >= 3:
+                break
+    if tool_result and tool_result.get("result") is not None:
+        sentence = describe_tool_result(str(tool_result.get("tool_name") or ""), tool_result.get("result"))
+        if sentence:
+            parts.append(sentence)
     if web_results:
-        parts.append("联网补充信息：")
-        parts.extend(f"- {item['title']}：{item['snippet'][:180]}" for item in web_results[:2])
-    parts.append("以上仅作为咨询指引，具体办理要求请以学校最新正式通知为准。")
+        parts.append("网上还有这些公开信息可以参考：")
+        for item in web_results[:2]:
+            snippet = _clip(item.get("snippet") or "", 160)
+            parts.append(f"- {_clip(item.get('title') or '网页资料', 40)}：{snippet}")
+    parts.append("以上内容仅供参考，具体办理要求请以学校最新正式通知为准。")
     return "\n\n".join(parts)
 
 
+SUGGESTION_BANK = {
+    "balance": ["如何给校园卡充值？", "校园卡消费流水怎么查询？", "校园卡余额不足时还能消费吗？"],
+    "lost": ["补办校园卡需要准备什么材料？", "校园卡挂失后原卡还能用吗？", "校园卡补办期间怎么在校内消费？"],
+    "consume": ["校园卡消费限额是多少？", "校园卡消费异常怎么核查？", "校园卡可以在哪里消费？"],
+    "discount": ["学生优惠资格怎么认定？", "校园卡优惠活动在哪里查询？", "毕业离校后优惠还在吗？"],
+    "activate": ["校园卡首次使用怎么激活？", "校园卡密码忘记怎么办？", "校园码在哪里出示？"],
+}
+DEFAULT_SUGGESTIONS = ["校园卡丢失后如何补办？", "校园卡有哪些充值方式？", "校园卡消费范围包括哪些？"]
+
+
 def make_suggestions(question: str, contexts: list[dict]) -> list[str]:
-    suggestions = ["校园卡丢失后如何补办？", "校园卡有哪些充值方式？", "校园卡消费范围包括哪些？"]
+    """按用户刚问的话题推荐下一轮可以继续问的问题，而不是永远给同一组固定问题。"""
+    text = question or ""
+    if any(word in text for word in ("余额", "充值", "到账", "扣款", "退费")):
+        suggestions = SUGGESTION_BANK["balance"]
+    elif any(word in text for word in ("丢", "挂失", "补办", "补卡", "解挂", "盗刷")):
+        suggestions = SUGGESTION_BANK["lost"]
+    elif any(word in text for word in ("消费", "流水", "限额", "商户", "终端", "对账")):
+        suggestions = SUGGESTION_BANK["consume"]
+    elif any(word in text for word in ("优惠", "活动", "减免", "资格")):
+        suggestions = SUGGESTION_BANK["discount"]
+    elif any(word in text for word in ("激活", "密码", "校园码", "门禁", "图书馆")):
+        suggestions = SUGGESTION_BANK["activate"]
+    else:
+        suggestions = DEFAULT_SUGGESTIONS
     if any("优惠" in str(item.get("title", "")) for item in contexts):
-        suggestions.insert(0, "校园卡优惠政策如何查询？")
-    if "补办" in question:
-        suggestions.insert(0, "补办校园卡需要准备什么材料？")
+        suggestions = ["校园卡优惠政策如何查询？"] + list(suggestions)
     return list(dict.fromkeys(suggestions))[:3]
 
 
@@ -211,11 +327,19 @@ def _chat_messages(question: str, contexts: list[dict], history: list[dict], web
     system = (
         "你是校园一卡通使用咨询助手。只能依据给定资料回答，不得编造金额、电话、时限或政策。"
         "涉及充值、挂失、退款等账户操作时只提供办理指引，不承诺代为执行。"
-        "资料不足时必须明确说明，并建议联系学校正式渠道。回答简洁、使用中文。\n\n"
+        "资料不足时必须明确说明，并建议联系学校正式渠道。回答简洁、使用中文。\n"
+        "输出要求：用自然语言直接回答，不要输出[资料1]这类引用编号，不要列出参考来源，"
+        "不要输出 JSON、字段名、参数名或接口路径；涉及金额时写成“128.50 元”。\n\n"
         "可用资料：\n" + "\n\n".join(sources)
     )
+    # 会话摘要属于系统上下文，不能混入历史轮次，否则会被模型当成用户发言。
+    summary_parts = [str(item.get("content", "")).strip() for item in history
+                     if item.get("role") == "system" and str(item.get("content", "")).strip()]
+    if summary_parts:
+        system += "\n\n此前会话摘要：" + " ".join(summary_parts)[:1200]
     messages = [{"role": "system", "content": system}]
-    for item in history[-10:]:
+    turns = [item for item in history if item.get("role") in {"user", "assistant"}][-10:]
+    for item in turns:
         role = "assistant" if item.get("role") == "assistant" else "user"
         content = str(item.get("content", ""))[:2000]
         if content:
@@ -230,6 +354,7 @@ async def stream_llm(question: str, contexts: list[dict], history: list[dict], w
         headers = {"Authorization": f"Bearer {settings.llm_api_key}", "Content-Type": "application/json"}
         payload = {"model": settings.llm_model, "messages": _chat_messages(question, contexts, history, web_results, tool_result),
                    "temperature": 0.2, "stream": True}
+        emitted = False
         try:
             async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
                 async with client.stream("POST", f"{settings.llm_base_url}/chat/completions",
@@ -240,17 +365,23 @@ async def stream_llm(question: str, contexts: list[dict], history: list[dict], w
                             continue
                         raw = line[5:].strip()
                         if raw == "[DONE]":
-                            return
+                            break
                         try:
                             data = json.loads(raw)
                             content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                         except (json.JSONDecodeError, IndexError, AttributeError):
                             continue
                         if content:
+                            emitted = True
                             yield content
-            return
         except Exception:
-            pass
+            # 已经流式输出过内容时，再追加整段抽取式兜底会得到“半截大模型 + 整段模板”的重复回答。
+            if emitted:
+                yield "\n\n（回答生成中断，请稍后重试。）"
+                return
+        # 模型正常返回但内容为空时也走抽取式兜底，避免用户收到空回答。
+        if emitted:
+            return
     answer = build_answer(question, contexts, web_results, tool_result)
     for index in range(0, len(answer), 20):
         yield answer[index:index + 20]

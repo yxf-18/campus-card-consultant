@@ -40,10 +40,9 @@ class LocalVectorStore:
     def index(self, document_id: int, version_no: int, title: str, category: str,
               chunks: list[dict], vectors: list[list[float]], embedding_model: str) -> list[dict]:
         with self.lock:
+            # 同一版本重试/重排时整版替换，避免文件变短后残留旧切片；更早版本保留。
             rows = [row for row in self._load()
-                    if not (row["document_id"] == document_id and row["version_no"] != version_no)]
-            new_ids = {f"{document_id}:{version_no}:{chunk['chunk_index']}" for chunk in chunks}
-            rows = [row for row in rows if row["vector_id"] not in new_ids]
+                    if not (row["document_id"] == document_id and row["version_no"] == version_no)]
             for chunk, vector in zip(chunks, vectors):
                 vector_id = f"{document_id}:{version_no}:{chunk['chunk_index']}"
                 rows.append({"vector_id": vector_id, "document_id": document_id, "version_no": version_no,
@@ -98,8 +97,10 @@ class ChromaVectorStore:
         collection.upsert(ids=ids, embeddings=vectors, documents=[chunk["content"] for chunk in chunks],
                           metadatas=metadatas)
         existing = collection.get(include=["metadatas"])
+        new_ids = set(ids)
+        # 只清理“同一版本”中不再存在的切片；旧版本保留，避免索引成功但业务库回滚时无法回退。
         stale = [item_id for item_id, metadata in zip(existing.get("ids", []), existing.get("metadatas", []))
-                 if int(metadata.get("version_no", 0)) != version_no]
+                 if int(metadata.get("version_no", 0)) == version_no and item_id not in new_ids]
         if stale:
             collection.delete(ids=stale)
         return [{"vector_id": item_id, "chunk_index": int(item_id.rsplit(":", 1)[1])} for item_id in ids]

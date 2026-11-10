@@ -130,6 +130,18 @@ async def chat_events(payload: ChatPayload):
         tool_result = await core_tool(payload.question, payload.user_context,
                                       route["db_tool"], route["params"])
 
+    # 越权查询他人余额时直接说明隐私规则，不继续检索网页或知识库，避免把无关信息拼进回答。
+    if tool_result and isinstance(tool_result.get("result"), dict) and tool_result["result"].get("denied"):
+        text = str(tool_result["result"].get("message") or
+                   "为了保护账户隐私，只能查询本人的校园卡余额。")
+        for index in range(0, len(text), 20):
+            yield "delta", {"content": text[index:index + 20]}
+        suggestions = make_suggestions(payload.question, [])
+        yield "suggestion", {"suggestions": suggestions}
+        yield "done", {"citations": [], "suggestions": suggestions,
+                       "guard": {"is_grounded": False, "reason": "隐私保护"}}
+        return
+
     local_evidence = bool(selected_contexts) or tool_has_evidence(tool_result)
     if payload.enable_web and (route["explicit_web"] or not local_evidence):
         web_results = await tavily_search(payload.question)

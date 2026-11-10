@@ -3,7 +3,6 @@ import { useAuthStore } from '@/stores/auth'
 const router=createRouter({history:createWebHistory(),routes:[
   {path:'/',redirect:'/login'},
   {path:'/login',component:()=>import('@/views/LoginView.vue'),meta:{public:true}},
-  {path:'/register',component:()=>import('@/views/RegisterView.vue'),meta:{public:true}},
   {path:'/preview',component:()=>import('@/views/PreviewView.vue'),meta:{public:true}},
   {path:'/bind-account',component:()=>import('@/views/BindAccountView.vue'),meta:{auth:true}},
   {path:'/app',component:()=>import('@/layouts/MobileLayout.vue'),meta:{auth:true},children:[

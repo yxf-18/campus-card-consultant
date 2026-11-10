@@ -1,5 +1,5 @@
 import api from './client'
-import type { ApiEnvelope, Category, DocumentItem, SyncTask, User } from '@/types'
+import type { ApiEnvelope, Category, DocumentItem, ProfileChangeRequest, User } from '@/types'
 
 export const authApi = {
   login: (body: { account: string; password: string; redirect_url?: string; client_type?: 'ADMIN' | 'MOBILE' }) => api.post<ApiEnvelope<any>>('/auth/login', body),
@@ -24,9 +24,9 @@ export const userApi = {
   list: (params: Record<string, unknown>) => api.get<ApiEnvelope<{ list: User[] }>>('/admin/users', { params }),
   setStatus: (id: number, status: string) => api.patch(`/admin/users/${id}/status`, { status })
 }
-export const syncApi = {
-  list: (params: Record<string, unknown>) => api.get<ApiEnvelope<{ list: SyncTask[] }>>('/admin/sync/tasks', { params }),
-  retry: (id: number) => api.post(`/admin/sync/tasks/${id}/retry`)
+export const profileRequestApi = {
+  list: (params: Record<string, unknown>) => api.get<ApiEnvelope<{ list: ProfileChangeRequest[] }>>('/admin/profile-requests', { params }),
+  review: (id: number, body: Record<string, unknown>) => api.patch(`/admin/profile-requests/${id}`, body)
 }
 export const feedbackApi = {
   list: (params: Record<string, unknown>) => api.get('/admin/feedbacks', { params }),

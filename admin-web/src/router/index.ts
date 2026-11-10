@@ -12,7 +12,7 @@ const router = createRouter({
       { path: 'categories', component: () => import('@/views/CategoriesView.vue') },
       { path: 'documents', component: () => import('@/views/DocumentsView.vue') },
       { path: 'users', component: () => import('@/views/UsersView.vue') },
-      { path: 'sync-tasks', component: () => import('@/views/SyncTasksView.vue') },
+      { path: 'profile-requests', component: () => import('@/views/ProfileRequestsView.vue') },
       { path: 'feedbacks', component: () => import('@/views/FeedbacksView.vue') },
       { path: 'configs', component: () => import('@/views/ConfigsView.vue') }
     ]},

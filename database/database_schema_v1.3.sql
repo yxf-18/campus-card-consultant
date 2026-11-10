@@ -232,3 +232,22 @@ CREATE TABLE IF NOT EXISTS chat_feedback (
   CONSTRAINT fk_feedback_user FOREIGN KEY (user_id) REFERENCES sys_user(id),
   CONSTRAINT fk_feedback_handled_by FOREIGN KEY (handled_by) REFERENCES sys_user(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS profile_change_request (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  field_name ENUM('phone','email') NOT NULL,
+  old_value VARCHAR(100) NULL,
+  new_value VARCHAR(100) NOT NULL,
+  status ENUM('PENDING','APPROVED','REJECTED') NOT NULL DEFAULT 'PENDING',
+  remark VARCHAR(500) NULL,
+  reviewed_by BIGINT UNSIGNED NULL,
+  reviewed_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY ix_profile_change_status_created (status, created_at),
+  KEY ix_profile_change_user_field (user_id, field_name, status),
+  CONSTRAINT fk_profile_change_user FOREIGN KEY (user_id) REFERENCES sys_user(id),
+  CONSTRAINT fk_profile_change_reviewer FOREIGN KEY (reviewed_by) REFERENCES sys_user(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

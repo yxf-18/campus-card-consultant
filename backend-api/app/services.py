@@ -4,18 +4,18 @@ import hashlib
 import json
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .ai_client import ai_client
 from .config import get_settings
 from .database import SessionLocal
 from .models import (
-    ChatFeedback, ChatMessage, ChatSession, KnowledgeCategory, KnowledgeChunk,
+    ChatCitation, ChatFeedback, ChatMessage, ChatSession, KnowledgeCategory, KnowledgeChunk,
     KnowledgeDocument, RagSyncTask, SysConfig, SysUser, now_local,
 )
 from .security import create_download_token
@@ -39,6 +39,72 @@ DEFAULT_CONFIGS = [
     ("web.enabled", "web", "true", "BOOL", "是否启用Web Search（三来源问答默认启用）"),
 ]
 
+# 配置不是“随便存一个字符串”：后台修改时必须先通过类型与业务范围校验，
+# 否则 top_k=0、下载有效期=0 之类的值会直接破坏问答和下载链路。
+CONFIG_RULES: dict[str, tuple[str, float | None, float | None]] = {
+    "home.documents_limit": ("int", 1, 20),
+    "rag.top_k": ("int", 1, 20),
+    "rag.similarity_threshold": ("float", 0.0, 1.0),
+    "chat.context_max_chars": ("int", 500, 20000),
+    "chat.history_turns": ("int", 1, 50),
+    "chat.session_retention_days": ("int", 7, 3650),
+    "auth.login_fail_limit": ("int", 1, 20),
+    "auth.login_lock_minutes": ("int", 1, 1440),
+    "upload.max_size_mb": ("int", 1, 100),
+    "download.url_ttl_seconds": ("int", 30, 3600),
+    "web.enabled": ("bool", None, None),
+    "service.channels": ("json", None, None),
+    "security.sensitive_words": ("json", None, None),
+}
+
+# 账户类操作只提供办理指引，业务后端与 AI 服务使用同一份口径。
+ACCOUNT_ACTION_PHRASES = (
+    "帮我充值", "替我充值", "帮我挂失", "替我挂失", "冻结我的卡",
+    "解冻我的卡", "帮我退款", "替我退款",
+)
+
+
+def validate_config_value(key: str, value_type: str, raw_value: str) -> str:
+    """校验并归一化后台配置值，非法值抛出 ValueError。"""
+    value = (raw_value or "").strip()
+    kind, lower, upper = CONFIG_RULES.get(key, (value_type.lower(), None, None))
+    if kind == "int":
+        if not re.fullmatch(r"\d+", value):
+            raise ValueError("该配置必须为正整数")
+        number = int(value)
+        if lower is not None and upper is not None and not lower <= number <= upper:
+            raise ValueError(f"该配置取值范围为 {int(lower)}-{int(upper)}")
+        return str(number)
+    if kind == "float":
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise ValueError("该配置必须为数字") from exc
+        if lower is not None and upper is not None and not lower <= number <= upper:
+            raise ValueError(f"该配置取值范围为 {lower:g}-{upper:g}")
+        return f"{number:g}"
+    if kind == "bool":
+        lowered = value.lower()
+        if lowered in {"true", "1"}:
+            return "true"
+        if lowered in {"false", "0"}:
+            return "false"
+        raise ValueError("该配置必须为布尔值")
+    if kind == "json":
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("该配置必须为合法JSON") from exc
+        if key == "security.sensitive_words":
+            if not isinstance(parsed, list) or not parsed or not all(
+                    isinstance(item, str) and item.strip() for item in parsed):
+                raise ValueError("敏感词配置必须为非空字符串数组")
+            parsed = [item.strip() for item in parsed]
+        if key == "service.channels" and not isinstance(parsed, dict):
+            raise ValueError("服务渠道配置必须为JSON对象")
+        return json.dumps(parsed, ensure_ascii=False)
+    return value
+
 
 def get_config(db: Session, key: str, default: str = "") -> str:
     row = db.query(SysConfig).filter(SysConfig.config_key == key).first()
@@ -57,6 +123,45 @@ def get_float_config(db: Session, key: str, default: float) -> float:
         return float(get_config(db, key, str(default)))
     except ValueError:
         return default
+
+
+def get_bool_config(db: Session, key: str, default: bool) -> bool:
+    value = get_config(db, key, "true" if default else "false").strip().lower()
+    if value in {"true", "1", "yes"}:
+        return True
+    if value in {"false", "0", "no"}:
+        return False
+    return default
+
+
+SENSITIVE_INTENT_HINTS = ("告诉我", "发给我", "提供给我", "明文", "完整", "截图", "拍照", "转发给我")
+
+
+def sensitive_reminder(db: Session, question: str) -> str:
+    """命中“敏感词 + 索取意图”时追加安全提醒，而不是对所有转账问题一刀切拒答。"""
+    try:
+        words = json.loads(get_config(db, "security.sensitive_words", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(words, list):
+        return ""
+    hits = [str(word).strip() for word in words
+            if isinstance(word, str) and word.strip() and word.strip() in question]
+    if not hits or not any(hint in question for hint in SENSITIVE_INTENT_HINTS):
+        return ""
+    return ("安全提醒：涉及" + "、".join(dict.fromkeys(hits)) +
+            "等敏感信息时，请仅通过学校正式渠道办理，不要向他人提供密码、验证码或完整身份证号。")
+
+
+def identity_conflict(db: Session, value: str | None, exclude_id: int | None = None) -> bool:
+    """用户名、手机号、邮箱、学号共用一个登录入口，因此不能跨字段重名。"""
+    if not value:
+        return False
+    query = db.query(SysUser.id).filter(or_(SysUser.username == value, SysUser.phone == value,
+                                            SysUser.email == value, SysUser.student_no == value))
+    if exclude_id is not None:
+        query = query.filter(SysUser.id != exclude_id)
+    return query.first() is not None
 
 
 def category_json(category: KnowledgeCategory, document_count: int | None = None) -> dict[str, Any]:
@@ -87,6 +192,20 @@ def document_json(document: KnowledgeDocument, chunk_count: int | None = None) -
     return data
 
 
+def visible_documents_query(db: Session):
+    """公开端、下载端和内部工具共用的“用户可见文档”过滤条件。"""
+    today = now_local().date()
+    return (db.query(KnowledgeDocument, KnowledgeCategory)
+            .join(KnowledgeCategory, KnowledgeCategory.id == KnowledgeDocument.category_id)
+            .filter(KnowledgeCategory.status == "ENABLED",
+                    KnowledgeDocument.status == "PUBLISHED",
+                    KnowledgeDocument.is_deleted.is_(False),
+                    or_(KnowledgeDocument.effective_date.is_(None),
+                        KnowledgeDocument.effective_date <= today),
+                    or_(KnowledgeDocument.expire_date.is_(None),
+                        KnowledgeDocument.expire_date >= today)))
+
+
 def is_document_visible(document: KnowledgeDocument, category: KnowledgeCategory | None, today: date | None = None) -> bool:
     today = today or now_local().date()
     return bool(category and category.status == "ENABLED" and document.status == "PUBLISHED"
@@ -111,8 +230,42 @@ def allowed_versions_for(db: Session, document_id: int | None = None) -> dict[in
     return versions
 
 
+_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+")
+
+
+def _text_tokens(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+def _best_snippet(text: str, query_tokens: set[str], limit: int = 700) -> str:
+    """在长文档中截取与问题最相关的一段，而不是永远返回开头 700 字。"""
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    step = max(1, limit // 2)
+    last_start = len(cleaned) - limit
+    best_start, best_hits = 0, -1
+    for start in range(0, last_start + 1, step):
+        window = cleaned[start:start + limit]
+        hits = sum(1 for token in query_tokens if token in window)
+        if hits > best_hits:
+            best_start, best_hits = start, hits
+    if best_start:
+        boundary = min((pos for pos in (
+            cleaned.find("\n", best_start, best_start + 120),
+            cleaned.find("。", best_start, best_start + 120),
+        ) if pos != -1), default=-1)
+        if boundary != -1:
+            best_start = boundary + 1
+    return cleaned[best_start:best_start + limit].strip() or cleaned[:limit]
+
+
 def local_retrieve(db: Session, question: str, allowed: dict[int, int], top_k: int,
-                   document_id: int | None = None) -> list[dict[str, Any]]:
+                   document_id: int | None = None, threshold: float = 0.12) -> list[dict[str, Any]]:
+    """AI 服务不可用时按词重合度应急检索，并保持与向量检索相近的召回门槛。"""
+    query_tokens = _text_tokens(question)
+    if not query_tokens:
+        return []
     rows_query = (db.query(KnowledgeDocument, KnowledgeCategory)
                   .join(KnowledgeCategory, KnowledgeCategory.id == KnowledgeDocument.category_id)
                   .filter(KnowledgeDocument.status == "PUBLISHED", KnowledgeDocument.is_deleted.is_(False),
@@ -122,22 +275,21 @@ def local_retrieve(db: Session, question: str, allowed: dict[int, int], top_k: i
     if document_id is not None:
         rows_query = rows_query.filter(KnowledgeDocument.id == document_id)
     rows = rows_query.all()
-    query_chars = set(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", question.lower()))
+    min_score = 0.0 if document_id is not None else max(0.15, min(0.6, threshold))
     scored: list[tuple[float, KnowledgeDocument, str]] = []
     for doc, category in rows:
         if not is_document_visible(doc, category):
             continue
         text = " ".join(filter(None, [doc.title, doc.summary, doc.keywords, doc.parsed_text]))
-        chars = set(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", text.lower()))
-        overlap = len(query_chars & chars)
-        score = overlap / max(1, len(query_chars)) + (0.3 if doc.id == document_id else 0)
-        snippet = (doc.parsed_text or doc.summary or doc.title)[:700]
+        matched = query_tokens & _text_tokens(text)
+        score = len(matched) / len(query_tokens) + (0.3 if doc.id == document_id else 0)
+        if score < min_score:
+            continue
+        snippet = _best_snippet(doc.parsed_text or doc.summary or doc.title, matched or query_tokens)
         scored.append((score, doc, snippet))
     scored.sort(key=lambda item: item[0], reverse=True)
     result = []
     for score, doc, snippet in scored[:top_k]:
-        if score <= 0 and not document_id:
-            continue
         result.append({"vector_id": f"local:{doc.id}", "chunk_id": None, "document_id": doc.id,
                        "title": doc.title, "snippet": snippet, "page_no": None, "score": round(score, 4)})
     return result
@@ -158,8 +310,8 @@ def save_upload(content: bytes, original_name: str) -> tuple[Path, str]:
     return target, digest
 
 
-def make_download_url(document_id: int) -> str:
-    token = create_download_token("document", document_id, 300)
+def make_download_url(document_id: int, ttl_seconds: int = 300) -> str:
+    token = create_download_token("document", document_id, max(1, ttl_seconds))
     # Keep both PC and mobile on the same origin as the frontend/proxy.
     return f"/api/v1/files/download/{token}"
 
@@ -275,6 +427,28 @@ def trigger_sync(db: Session, document: KnowledgeDocument, task_type: str, user_
     db.commit()
     db.refresh(task)
     return task
+
+
+def purge_expired_sessions(db: Session, retention_days: int) -> int:
+    """物理清理“已删除且超过保留期”的会话，避免问答内容长期滞留。"""
+    cutoff = now_local() - timedelta(days=max(1, retention_days))
+    session_ids = [row[0] for row in db.query(ChatSession.id).filter(
+        ChatSession.status == "DELETED",
+        ChatSession.deleted_at.is_not(None),
+        ChatSession.deleted_at < cutoff).all()]
+    if not session_ids:
+        return 0
+    message_ids = [row[0] for row in db.query(ChatMessage.id).filter(
+        ChatMessage.session_id.in_(session_ids)).all()]
+    if message_ids:
+        db.query(ChatMessage).filter(ChatMessage.id.in_(message_ids)).update(
+            {ChatMessage.reply_to_message_id: None}, synchronize_session=False)
+        db.query(ChatCitation).filter(ChatCitation.message_id.in_(message_ids)).delete(synchronize_session=False)
+        db.query(ChatFeedback).filter(ChatFeedback.message_id.in_(message_ids)).delete(synchronize_session=False)
+        db.query(ChatMessage).filter(ChatMessage.id.in_(message_ids)).delete(synchronize_session=False)
+    db.query(ChatSession).filter(ChatSession.id.in_(session_ids)).delete(synchronize_session=False)
+    db.commit()
+    return len(session_ids)
 
 
 def export_user_rows(db: Session, start_date: date, end_date: date, desensitize: bool = True) -> list[list[Any]]:
