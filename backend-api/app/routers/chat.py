@@ -122,7 +122,11 @@ def session_messages(session_id: int, user: SysUser = Depends(require_mobile_use
             "sort_order": citation.sort_order, "retrieved_at": fmt_dt(citation.retrieved_at)})
     data = []
     for message in messages:
-        item = {"message_id": message.id, "role": message.role, "content": message.content,
+        message_content = message.content
+        if (message.role == "ASSISTANT" and not (message_content or "").strip()
+                and message.status == "FAILED"):
+            message_content = "上一次回答未能完成，请重新提问。"
+        item = {"message_id": message.id, "role": message.role, "content": message_content,
                 "status": message.status, "is_grounded": message.is_grounded,
                 "suggestions": message.suggestions or [], "created_at": fmt_dt(message.created_at),
                 "citations": citations.get(message.id, [])}
@@ -265,6 +269,7 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
     suggestions: list[str] = []
     grounded = False
     model_name = "offline-extractive"
+    finished = False
     try:
         top_k = get_int_config(db, "rag.top_k", 5)
         threshold = get_float_config(db, "rag.similarity_threshold", 0.12)
@@ -338,6 +343,7 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
         yield "suggestion", {"suggestions": suggestions}
         saved = persist_answer(assistant_id, "SUCCESS", content, citations, suggestions,
                                grounded, model_name, started)
+        finished = True
         yield "done", {"message_id": assistant_id, "session_id": session_id,
                        "citations": saved, "suggestions": suggestions,
                        "guard": {"is_grounded": grounded,
@@ -345,8 +351,17 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
     except Exception as exc:
         persist_answer(assistant_id, "FAILED", content, citations, suggestions,
                        grounded, model_name, started)
+        finished = True
         yield "error", {"code": 400101, "message": f"AI回答生成失败：{str(exc)[:120]}"}
     finally:
+        if not finished:
+            interrupted = content.strip()
+            interrupted = (
+                f"{interrupted}\n\n（上一次回答未完成，请重新提问。）"
+                if interrupted else "上一次回答未能完成，请重新提问。"
+            )
+            persist_answer(assistant_id, "FAILED", interrupted, citations, suggestions,
+                           False, model_name, started)
         db.close()
 
 
@@ -382,7 +397,7 @@ async def send_message(payload: ChatRequest, user: SysUser = Depends(require_mob
     db.add(question)
     db.flush()
     assistant = ChatMessage(session_id=session.id, role="ASSISTANT", reply_to_message_id=question.id,
-                            content="", status="FAILED", is_grounded=False)
+                            content="", status="STREAMING", is_grounded=False)
     db.add(assistant)
     session.last_message_at = now_local()
     db.commit()

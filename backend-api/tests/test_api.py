@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from decimal import Decimal
 
@@ -648,3 +649,76 @@ def test_conversation_two_stage_loss_reissue_and_token_reuse(client: TestClient)
     }).json()["result"]
     assert status["ok"] is True
     assert status["data"]["order"]["events"]
+
+
+def test_interrupted_stream_is_persisted_and_history_has_no_forever_typing(
+    client: TestClient, monkeypatch,
+):
+    from app.ai_client import ai_client
+    from app.database import SessionLocal
+    from app.models import ChatMessage, ChatSession, SysUser
+    from app.routers.chat import run_generation
+
+    db = SessionLocal()
+    try:
+        user = db.query(SysUser).filter(SysUser.username == "student").first()
+        session = ChatSession(user_id=user.id, title="中断测试")
+        db.add(session)
+        db.flush()
+        question = ChatMessage(session_id=session.id, role="USER", content="测试中断")
+        db.add(question)
+        db.flush()
+        assistant = ChatMessage(
+            session_id=session.id, role="ASSISTANT", reply_to_message_id=question.id,
+            content="", status="STREAMING",
+        )
+        db.add(assistant)
+        legacy_empty = ChatMessage(
+            session_id=session.id, role="ASSISTANT", reply_to_message_id=question.id,
+            content="", status="FAILED",
+        )
+        db.add(legacy_empty)
+        db.commit()
+        session_id, assistant_id, legacy_id = session.id, assistant.id, legacy_empty.id
+    finally:
+        db.close()
+
+    async def fake_retrieve(*_args, **_kwargs):
+        return []
+
+    async def fake_stream_chat(_payload):
+        yield "delta", {"content": "部分回答"}
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(ai_client, "retrieve", fake_retrieve)
+    monkeypatch.setattr(ai_client, "stream_chat", fake_stream_chat)
+
+    async def interrupt():
+        generator = run_generation(
+            assistant_id, session_id, "测试中断", None, False, True, [],
+            {"user_id": 1, "role": "USER", "student_no": "20230001"},
+        )
+        event, data = await anext(generator)
+        assert event == "delta" and data["content"] == "部分回答"
+        await generator.aclose()
+
+    asyncio.run(interrupt())
+    db = SessionLocal()
+    try:
+        saved = db.get(ChatMessage, assistant_id)
+        assert saved.status == "FAILED"
+        assert "部分回答" in saved.content
+        assert "上一次回答未完成" in saved.content
+    finally:
+        db.close()
+
+    headers = auth_headers(login(client, "student", "Student123", "MOBILE"))
+    history = client.get(f"/api/v1/chat/sessions/{session_id}/messages", headers=headers)
+    assert history.status_code == 200
+    messages = history.json()["data"]["messages"]
+    saved_message = next(item for item in messages if item["message_id"] == assistant_id)
+    assert saved_message["content"]
+    assert saved_message["status"] == "FAILED"
+    legacy_message = next(item for item in messages if item["message_id"] == legacy_id)
+    assert legacy_message["content"] == "上一次回答未能完成，请重新提问。"
+    assert legacy_message["status"] == "FAILED"

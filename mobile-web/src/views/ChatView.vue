@@ -31,7 +31,7 @@ async function send(text?:string){
   const question=(text??input.value).trim()
   if(!question||streaming.value)return
   input.value='';streaming.value=true;controller.value=new AbortController()
-  const assistant:ChatMessage={role:'ASSISTANT',content:'',status:'SUCCESS',suggestions:[]}
+  const assistant:ChatMessage={role:'ASSISTANT',content:'',status:'STREAMING',suggestions:[]}
   messages.value.push({role:'USER',content:question},assistant)
   scrollBottom()
   try{
@@ -79,7 +79,7 @@ onBeforeUnmount(()=>controller.value?.abort())
 </script>
 <template>
   <div class="cc-chat">
-    <header class="cc-chat-head"><button class="cc-back" @click="router.push('/app/home')">‹</button><div><span class="cc-eyebrow">校园卡助手</span><h2>{{sessionId?'继续咨询':'智能问答'}}</h2></div><span class="cc-online">在线</span></header>
+    <header class="cc-chat-head"><button class="cc-back" @click="router.push('/app/home')">‹</button><div><span class="cc-eyebrow">西安理工大学 · 校园卡助手</span><h2>{{sessionId?'继续咨询':'智能问答'}}</h2></div><span class="cc-online">在线</span></header>
     <div ref="scroller" class="cc-scroll">
       <van-loading v-if="loading" class="cc-loading" />
       <section v-if="welcome" class="cc-welcome">
@@ -98,7 +98,8 @@ onBeforeUnmount(()=>controller.value?.abort())
           <div v-if="message.role==='ASSISTANT'" class="cc-avatar">AI</div>
           <div class="cc-bubble">
             <div v-if="message.content" class="cc-markdown" v-html="render(message.content)"></div>
-            <div v-else class="cc-typing"><i></i><i></i><i></i></div>
+            <div v-else-if="message.status==='STREAMING'" class="cc-typing"><i></i><i></i><i></i></div>
+            <div v-else class="cc-interrupted">上一次回答未能完成，请重新提问。</div>
             <div v-if="message.role==='ASSISTANT'&&message.suggestions?.length&&!streaming" class="cc-suggestions">
               <p>你还可以问</p>
               <button v-for="item in message.suggestions" :key="item" @click="send(item)">{{item}}</button>
@@ -146,6 +147,7 @@ onBeforeUnmount(()=>controller.value?.abort())
 .cc-markdown :deep(code){background:#eef4f6;border-radius:4px;padding:1px 4px;font-size:12px}
 .cc-markdown :deep(a){color:#0f7c73;text-decoration:none}
 .cc-typing{display:flex;gap:4px;padding:3px 0}.cc-typing i{width:6px;height:6px;border-radius:50%;background:#9ab8b8;animation:cc-blink 1s infinite}.cc-typing i:nth-child(2){animation-delay:.15s}.cc-typing i:nth-child(3){animation-delay:.3s}
+.cc-interrupted{color:#8798a1;font-size:12px}
 @keyframes cc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
 .cc-suggestions{margin-top:12px;padding-top:10px;border-top:1px dashed #e4eef0}.cc-suggestions p{margin:0 0 7px;font-size:10px;color:#93a4ad}
 .cc-suggestions button{display:block;width:100%;text-align:left;border:1px solid #dcebe8;background:#f7fcfb;border-radius:11px;padding:9px 11px;margin-bottom:6px;color:#2b5a60;font-size:12px}

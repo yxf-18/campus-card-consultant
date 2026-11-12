@@ -18,6 +18,8 @@ from .config import get_settings
 settings = get_settings()
 logger = logging.getLogger("campus_card.web_search")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+SCHOOL_NAME = "西安理工大学"
+SCHOOL_DOMAIN = settings.search_site_domain or "xaut.edu.cn"
 SAFE_REFUSAL_PHRASES = ("帮我退款", "替我退款", "退到银行卡", "真实支付")
 WEB_FOCUS_TERMS = (
     "校园卡", "一卡通", "充值", "补办", "挂失", "解挂", "消费", "余额", "优惠",
@@ -91,6 +93,8 @@ def build_web_query(question: str) -> str:
     query = re.sub(r"\s+", " ", query).strip()
     if campus_question and not any(term in query for term in ("校园卡", "一卡通", "卡务")):
         query = f"校园卡 {query}".strip()
+    if campus_question and SCHOOL_NAME not in query:
+        query = f"{SCHOOL_NAME} {query}".strip()
     if "校园卡" in query and "一卡通" not in query:
         query = query.replace("校园卡", "校园一卡通 校园卡")
     if any(term in query for term in ("优惠", "活动", "补贴")):
@@ -101,10 +105,8 @@ def build_web_query(question: str) -> str:
             query = f"{query} {now:%Y-%m-%d}"
     elif now.strftime("%Y") not in query:
         query = f"{query} {now:%Y}"
-    if campus_question and settings.search_site_domain:
-        query = f"{query} site:{settings.search_site_domain}"
-    elif campus_question and wants_official_source(question):
-        query = f"{query} site:edu.cn"
+    if campus_question:
+        query = f"{query} site:{SCHOOL_DOMAIN}"
     return query[:120] or "校园卡 最新信息"
 
 
@@ -133,6 +135,8 @@ def rank_web_results(question: str, results: list[dict[str, Any]], limit: int = 
         if dedupe_key in seen:
             continue
         corpus = f"{title} {snippet}".lower()
+        if campus_question and SCHOOL_DOMAIN.lower() not in url.lower():
+            continue
         term_hits = sum(term in corpus for term in requested_terms)
         core_hit = any(term in corpus for term in ("校园卡", "一卡通", "卡务"))
         overlap = len(query_bigrams & _search_bigrams(corpus)) / max(1, len(query_bigrams))
@@ -148,8 +152,6 @@ def rank_web_results(question: str, results: list[dict[str, Any]], limit: int = 
         if campus_question and telecom_offer and not campus_card_context:
             continue
         if official_only and not authoritative:
-            continue
-        if settings.search_site_domain and settings.search_site_domain.lower() not in url.lower():
             continue
         seen.add(dedupe_key)
         published = _extract_published_date(
@@ -254,8 +256,8 @@ async def tavily_search(question: str) -> list[dict[str, Any]]:
                     "max_results": 8, "search_depth": "advanced", "include_answer": False,
                     "include_raw_content": "text", "topic": "general",
                 }
-                if is_campus_card_question(question) and settings.search_site_domain:
-                    request_data["include_domains"] = [settings.search_site_domain]
+                if is_campus_card_question(question):
+                    request_data["include_domains"] = [SCHOOL_DOMAIN]
                 response = await client.post("https://api.tavily.com/search", json=request_data)
             response.raise_for_status()
             raw_results = response.json().get("results", [])[:8]
@@ -298,7 +300,7 @@ def small_talk_response(question: str) -> str | None:
     normalized = re.sub(r"[\s，。！？!?,.~～]+", "", question or "").lower()
     if normalized in GREETING_WORDS:
         return (
-            "你好，我是校园卡智能助手。你可以直接问我校园卡充值、挂失补办、消费、"
+            "你好，我是西安理工大学校园卡智能助手。你可以直接问我校园卡充值、挂失补办、消费、"
             "优惠、使用指南或本人余额等问题。"
         )
     if normalized in THANKS_WORDS:
@@ -899,7 +901,7 @@ def _chat_messages(question: str, contexts: list[dict], history: list[dict], web
         sources.append("[系统工具] " + json.dumps(tool_result.get("result"), ensure_ascii=False))
     if campus_question:
         system = (
-            "你是校园一卡通使用咨询助手。只能依据给定资料回答，不得编造金额、电话、时限或政策。"
+            f"你是{SCHOOL_NAME}校园一卡通使用咨询助手。只能依据给定资料回答，不得编造金额、电话、时限或政策。"
             "本项目处于本地演示模式：充值、挂失、解挂和补办预约会在本地演示库中执行，不接真实支付。"
             "涉及个人余额、流水、统计、预测、卡状态或工单时，必须先以系统工具结果为准；没有工具结果不得输出数字或状态。"
             "办理类请求先说明影响，再根据准备好的动作摘要轻确认；用户明确同意后才提交，用户未同意不得执行。"
@@ -931,10 +933,10 @@ def _chat_messages(question: str, contexts: list[dict], history: list[dict], web
                      if item.get("role") == "system" and str(item.get("content", "")).strip()]
     if summary_parts:
         system += "\n\n此前会话摘要：" + " ".join(summary_parts)[:1200]
-    if campus_question and web_results and not settings.search_site_domain:
+    if campus_question and web_results:
         system += (
-            "\n\n当前未配置本校官网域名。只能表述为“检索到的高校官网公开资料”，"
-            "不得把这些页面说成本校今天发布的通知。"
+            f"\n\n校园卡联网资料只来自{SCHOOL_NAME}官网（{SCHOOL_DOMAIN}）。"
+            "不得引用其他高校、商业培训机构或运营商页面作为本校校园卡依据。"
         )
     messages = [{"role": "system", "content": system}]
     turns = [item for item in history if item.get("role") in {"user", "assistant"}][-10:]

@@ -12,7 +12,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import get_settings
 from .database import SessionLocal, engine, init_db
-from .models import RagSyncTask
+from .models import ChatMessage, RagSyncTask
 from .responses import (ApiError, api_error_handler, fail, unhandled_error_handler,
                         validation_error_handler)
 from .routers import admin_categories, admin_documents, admin_ops, auth, card, chat, documents
@@ -32,6 +32,17 @@ async def lifespan(_app: FastAPI):
         db.query(RagSyncTask).filter(RagSyncTask.status == "RUNNING").update(
             {RagSyncTask.status: "FAILED", RagSyncTask.error_message: "服务重启导致任务中断，可重试"},
             synchronize_session=False)
+        stale_answers = db.query(ChatMessage).filter(
+            ChatMessage.role == "ASSISTANT",
+            ChatMessage.status == "STREAMING",
+        ).all()
+        for message in stale_answers:
+            message.status = "FAILED"
+            message.is_grounded = False
+            if (message.content or "").strip():
+                message.content += "\n\n（上一次回答未完成，请重新提问。）"
+            else:
+                message.content = "上一次回答未能完成，请重新提问。"
         db.commit()
         # 已删除会话按配置的保留期做物理清理，避免过期问答内容长期滞留。
         purge_expired_sessions(db, get_int_config(db, "chat.session_retention_days", 180))

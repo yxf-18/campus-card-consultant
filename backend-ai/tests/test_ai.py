@@ -89,6 +89,8 @@ def test_web_search_parser_and_three_source_defaults():
 def test_web_query_rewrite_and_result_filtering():
     query = build_web_query("请问今天学校官网有什么最新的校园卡优惠？")
     assert "校园卡" in query
+    assert "西安理工大学" in query
+    assert "site:xaut.edu.cn" in query
     assert "请问" not in query
     assert "有什么" not in query
     ranked = rank_web_results(
@@ -96,7 +98,7 @@ def test_web_query_rewrite_and_result_filtering():
         [
             {"title": "例子2：校内导师", "url": "https://example.com/team", "snippet": "李薇、邱原"},
             {"title": "校园卡充值说明", "url": "https://example.com/recharge", "snippet": "充值渠道说明"},
-            {"title": "学校最新校园卡优惠通知", "url": "https://school.edu.cn/card", "snippet": "校园卡优惠活动通知"},
+            {"title": "学校最新校园卡优惠通知", "url": "https://xxh.xaut.edu.cn/card", "snippet": "校园卡优惠活动通知"},
         ],
     )
     assert ranked
@@ -114,13 +116,13 @@ def test_official_web_results_filter_telecom_and_require_dates():
         },
         {
             "title": "校园一卡通优惠通知",
-            "url": "https://card.example.edu.cn/notice",
+            "url": "https://xxh.xaut.edu.cn/notice",
             "snippet": "校园一卡通充值活动通知",
             "raw_content": "发布日期：2026-11-10 校园一卡通充值活动说明",
         },
     ])
     assert ranked
-    assert ranked[0]["url"].endswith("card.example.edu.cn/notice")
+    assert ranked[0]["url"].endswith("xxh.xaut.edu.cn/notice")
     assert ranked[0]["published"] == "2026-11-10"
     assert ranked[0]["retrieved_at"]
     assert _extract_published_date("https://example.edu.cn/2026/0712/page.htm") == "2026-07-12"
@@ -143,17 +145,19 @@ def test_general_web_question_is_not_forced_into_campus_card_scope():
 def test_web_results_enter_the_final_model_prompt():
     result = {
         "title": "校园一卡通服务通知",
-        "url": "https://card.example.edu.cn/notice/1",
+        "url": "https://xxh.xaut.edu.cn/notice/1",
         "snippet": "校园一卡通服务安排。",
         "published": "2026-11-10",
         "retrieved_at": "2026-11-12",
     }
-    messages = _chat_messages("今天最新通知", [], [], [result], None)
+    messages = _chat_messages("今天最新校园卡通知", [], [], [result], None)
     system = messages[0]["content"]
     assert "[网页1]" in system
     assert result["url"] in system
     assert "2026-11-10" in system
-    assert "信息来源" not in system
+    assert "信息来源：\n" not in system
+    assert "西安理工大学" in system
+    assert "xaut.edu.cn" in system
 
 
 def test_question_source_routing():
