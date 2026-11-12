@@ -12,7 +12,7 @@ from app.providers import (build_answer, build_web_query, classify_question, mak
                            format_tool_answer, parse_so_results, plan_tool_requests,
                            rank_web_results, safe_refusal,
                            small_talk_response, _chat_messages, _extract_published_date,
-                           _web_source_footer)
+                           is_campus_card_question)
 from app.schemas import ChatPayload
 from app.vector_store import LocalVectorStore
 from pathlib import Path
@@ -124,9 +124,20 @@ def test_official_web_results_filter_telecom_and_require_dates():
     assert ranked[0]["published"] == "2026-11-10"
     assert ranked[0]["retrieved_at"]
     assert _extract_published_date("https://example.edu.cn/2026/0712/page.htm") == "2026-07-12"
-    footer = _web_source_footer(ranked)
-    assert "信息来源" in footer and "检索日期" in footer
-    assert ranked[0]["url"] in footer and "2026-11-10" in footer
+
+
+def test_general_web_question_is_not_forced_into_campus_card_scope():
+    question = "今天西安的天气是怎样的"
+    assert not is_campus_card_question(question)
+    query = build_web_query(question)
+    assert "校园卡" not in query
+    assert "西安" in query and "天气" in query
+    ranked = rank_web_results(question, [
+        {"title": "西安天气预报", "url": "https://weather.com.cn/xian", "snippet": "西安今天天气"},
+        {"title": "校园卡补办", "url": "https://school.edu.cn/card", "snippet": "校园卡办理"},
+    ])
+    assert ranked
+    assert ranked[0]["url"].startswith("https://weather.com.cn")
 
 
 def test_web_results_enter_the_final_model_prompt():
@@ -142,6 +153,7 @@ def test_web_results_enter_the_final_model_prompt():
     assert "[网页1]" in system
     assert result["url"] in system
     assert "2026-11-10" in system
+    assert "信息来源" not in system
 
 
 def test_question_source_routing():

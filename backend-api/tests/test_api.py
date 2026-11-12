@@ -237,6 +237,7 @@ def test_explicit_web_question_skips_document_retrieval():
 
     assert not is_web_first_question("今天学校官网有什么最新优惠", True)
     assert is_web_first_question("今天有什么最新校园卡服务通知", True)
+    assert is_web_first_question("今天西安的天气是怎样的", True)
     assert not is_web_first_question("校园卡丢失后怎么补办", True)
     assert not is_web_first_question("今天学校官网有什么最新优惠", False)
 

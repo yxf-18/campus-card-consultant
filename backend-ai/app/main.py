@@ -15,8 +15,9 @@ from fastapi.responses import StreamingResponse
 from .config import get_settings
 from .documents import chunk_document, parse_document
 from .embeddings import embedding_provider
-from .providers import (classify_question, core_tool, format_tool_answer, make_suggestions,
-                        plan_tool_requests, safe_refusal, small_talk_response,
+from .providers import (classify_question, core_tool, format_tool_answer,
+                        is_campus_card_question, make_suggestions, plan_tool_requests,
+                        safe_refusal, small_talk_response,
                         stream_llm, tavily_search, tool_has_evidence)
 from .schemas import ChatPayload, RetrieveRequest, SummarizeRequest, UnindexRequest
 from .vector_store import vector_store
@@ -193,7 +194,9 @@ async def chat_events(payload: ChatPayload):
     if citations:
         yield "citation", {"citations": citations}
 
-    if not selected_contexts and not web_results and not tool_has_evidence(tool_result):
+    general_question = not is_campus_card_question(payload.question)
+    if (not selected_contexts and not web_results and not tool_has_evidence(tool_result)
+            and not general_question):
         text = ("暂未在本地知识库或业务数据库中找到足够依据。请补充问题，或联系校园卡服务中心等学校正式渠道核实；"
                 "本工具不会编造政策、金额或办理时限。")
         for index in range(0, len(text), 20):

@@ -32,10 +32,17 @@ LOCAL_SOURCE_HINTS = (
     "优惠", "怎么", "如何", "流程", "规则", "政策", "材料", "费用",
     "补助", "挂失", "补办", "充值", "消费", "限额",
 )
+CAMPUS_CARD_HINTS = (
+    "校园卡", "一卡通", "卡务", "校园码", "卡片", "补办", "补卡", "挂失",
+    "解挂", "充值", "余额", "流水", "账单", "消费明细", "交易记录", "退款",
+    "工单", "补助入账", "学校官网", "优惠活动",
+)
 
 
 def is_web_first_question(question: str, enable_web: bool) -> bool:
     text = question or ""
+    if enable_web and not any(word in text for word in CAMPUS_CARD_HINTS):
+        return True
     return bool(
         enable_web
         and any(word in text for word in WEB_FIRST_HINTS)
