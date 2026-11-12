@@ -42,10 +42,12 @@ data: {"content":"增量文本"}
 
 - `POST /index`、`POST /unindex`、`POST /retrieve`
 - `POST /chat/stream`、`POST /summarize`
-- 业务内部工具 `POST /internal/v1/tools/query` 支持 `find_documents`、`list_categories`、`get_service_channels`、`get_card_balance`
+- 业务内部工具 `POST /internal/v1/tools/query` 支持文档目录、本人余额、消费明细、聚合统计、环比、补助记录、余额预测、工单进度，以及 `prepare_action` / `commit_action` / `cancel_action` 两阶段办理。
 - `GET /health`
 
 `get_card_balance` 只能按当前登录普通用户查询本人账户；尝试按学号或卡号查询他人账户会返回 403，AI 服务会直接给出隐私提示，不继续检索网页。
+
+`prepare_action` 返回一次性和短期有效的确认令牌；令牌不会进入模型上下文或用户回答。`commit_action` 只接受当前用户、当前卡号、动作类型和参数摘要均匹配的有效令牌；重复提交不会生成第二张工单。
 
 ## 业务错误码
 

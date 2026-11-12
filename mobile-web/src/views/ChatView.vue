@@ -38,10 +38,12 @@ async function send(text?:string){
     await streamChat({question,session_id:sessionId.value,document_id:documentId.value,enable_web:true,enable_db_tool:true,stream:true},event=>{
       if(event.event==='delta')assistant.content+=event.data.content||''
       else if(event.event==='suggestion')assistant.suggestions=event.data.suggestions||[]
+      else if(event.event==='citation')assistant.citations=event.data.citations||[]
       else if(event.event==='done'){
         assistant.message_id=event.data.message_id
         assistant.status='SUCCESS'
         assistant.suggestions=event.data.suggestions||assistant.suggestions
+        assistant.citations=event.data.citations||assistant.citations
         if(!sessionId.value){sessionId.value=event.data.session_id;router.replace(`/app/chat/${event.data.session_id}`)}
       }
       else if(event.event==='error'){
@@ -83,11 +85,12 @@ onBeforeUnmount(()=>controller.value?.abort())
       <section v-if="welcome" class="cc-welcome">
         <div class="cc-orb">AI</div>
         <h2>有什么校园卡问题？</h2>
-        <p>直接描述你的情况即可，我会给出简洁的办理建议；涉及账户操作时只提供指引，不会替你操作。</p>
+        <p>直接描述你的情况即可。我可以查本人账单、解释补助和预测余额，也能在本地演示环境办理挂失、补办预约与模拟充值。</p>
         <div class="cc-prompts">
-          <button @click="send('校园卡丢失后应该怎么补办？')">校园卡丢失后应该怎么补办？</button>
-          <button @click="send('校园卡有哪些充值方式？')">校园卡有哪些充值方式？</button>
-          <button @click="send('校园卡消费范围包括哪些？')">校园卡消费范围包括哪些？</button>
+          <button @click="send('这个月花了多少？')">这个月花了多少？</button>
+          <button @click="send('哪块花得最多？')">哪块花得最多？</button>
+          <button @click="send('我卡丢了')">我卡丢了</button>
+          <button @click="send('今天学校官网有什么最新的校园卡优惠？')">查今天最新校园卡优惠</button>
         </div>
       </section>
       <template v-for="(message,index) in messages" :key="message.message_id||index">
@@ -96,6 +99,14 @@ onBeforeUnmount(()=>controller.value?.abort())
           <div class="cc-bubble">
             <div v-if="message.content" class="cc-markdown" v-html="render(message.content)"></div>
             <div v-else class="cc-typing"><i></i><i></i><i></i></div>
+            <div v-if="message.role==='ASSISTANT'&&!message.content.includes('信息来源：')&&message.citations?.some(item=>item.source_type==='WEB')" class="cc-sources">
+              <p>网络来源</p>
+              <a v-for="item in message.citations.filter(item=>item.source_type==='WEB')" :key="item.citation_id||item.source_url"
+                 :href="item.source_url" target="_blank" rel="noopener noreferrer">
+                <span>{{item.title}}</span>
+                <small>{{item.retrieved_at?`检索于 ${item.retrieved_at.slice(0,10)}`:'网络公开资料'}}</small>
+              </a>
+            </div>
             <div v-if="message.role==='ASSISTANT'&&message.suggestions?.length&&!streaming" class="cc-suggestions">
               <p>你还可以问</p>
               <button v-for="item in message.suggestions" :key="item" @click="send(item)">{{item}}</button>
@@ -145,6 +156,7 @@ onBeforeUnmount(()=>controller.value?.abort())
 .cc-typing{display:flex;gap:4px;padding:3px 0}.cc-typing i{width:6px;height:6px;border-radius:50%;background:#9ab8b8;animation:cc-blink 1s infinite}.cc-typing i:nth-child(2){animation-delay:.15s}.cc-typing i:nth-child(3){animation-delay:.3s}
 @keyframes cc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
 .cc-suggestions{margin-top:12px;padding-top:10px;border-top:1px dashed #e4eef0}.cc-suggestions p{margin:0 0 7px;font-size:10px;color:#93a4ad}
+.cc-sources{margin-top:12px;padding:10px 11px;border-radius:12px;background:#f3f8fa}.cc-sources p{margin:0 0 7px;font-size:10px;color:#7f949e;font-weight:700}.cc-sources a{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:7px 0;border-top:1px solid #e4edef;color:#176d68;text-decoration:none}.cc-sources a:first-of-type{border-top:0}.cc-sources span{font-size:12px;line-height:1.45}.cc-sources small{font-size:9px;color:#8b9ca4;white-space:nowrap}
 .cc-suggestions button{display:block;width:100%;text-align:left;border:1px solid #dcebe8;background:#f7fcfb;border-radius:11px;padding:9px 11px;margin-bottom:6px;color:#2b5a60;font-size:12px}
 .cc-feedback{display:flex;align-items:center;gap:7px;margin-top:10px;padding-top:9px;border-top:1px dashed #e4eef0;color:#8497a5;font-size:11px}
 .cc-feedback button{border:1px solid #d7e7e5;background:#f8fcfb;color:#2b5a60;border-radius:9px;padding:4px 9px;font-size:11px}

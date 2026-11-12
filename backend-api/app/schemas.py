@@ -153,7 +153,8 @@ class ConfigUpdateRequest(BaseModel):
 
 
 class InternalToolRequest(BaseModel):
-    tool_name: Literal["find_documents", "list_categories", "get_service_channels", "get_card_balance"]
+    tool_name: str = Field(min_length=1, max_length=80)
+    question: str = Field(default="", max_length=1000)
     params: dict = Field(default_factory=dict)
     user_context: dict = Field(default_factory=dict)
 

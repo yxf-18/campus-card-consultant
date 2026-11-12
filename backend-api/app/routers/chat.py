@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..ai_client import AIServiceError, ai_client
+from ..conversation_service import get_pending_action_token
 from ..database import SessionLocal, get_db
 from ..dependencies import require_mobile_user
 from ..models import (ChatCitation, ChatFeedback, ChatMessage, ChatSession, KnowledgeCategory,
@@ -27,10 +28,19 @@ from ..utils import default_suggestions, fmt_dt, pagination
 router = APIRouter(prefix="/chat", tags=["AI问答与会话"])
 
 WEB_FIRST_HINTS = ("最新", "实时", "今天", "今日", "今年", "新闻", "官网", "联网", "网上查询")
+LOCAL_SOURCE_HINTS = (
+    "优惠", "怎么", "如何", "流程", "规则", "政策", "材料", "费用",
+    "补助", "挂失", "补办", "充值", "消费", "限额",
+)
 
 
 def is_web_first_question(question: str, enable_web: bool) -> bool:
-    return bool(enable_web and any(word in (question or "") for word in WEB_FIRST_HINTS))
+    text = question or ""
+    return bool(
+        enable_web
+        and any(word in text for word in WEB_FIRST_HINTS)
+        and not any(word in text for word in LOCAL_SOURCE_HINTS)
+    )
 
 
 def get_owned_session(db: Session, session_id: int, user_id: int) -> ChatSession:
@@ -102,7 +112,7 @@ def session_messages(session_id: int, user: SysUser = Depends(require_mobile_use
             "document_id": citation.document_id, "title": citation.title,
             "source_url": citation.source_url or "", "snippet": citation.snippet or "",
             "page_no": citation.page_no, "tool_name": citation.tool_name or "",
-            "sort_order": citation.sort_order})
+            "sort_order": citation.sort_order, "retrieved_at": fmt_dt(citation.retrieved_at)})
     data = []
     for message in messages:
         item = {"message_id": message.id, "role": message.role, "content": message.content,
@@ -203,15 +213,17 @@ def persist_answer(assistant_id: int, status: str, content: str, citations: list
         db.query(ChatCitation).filter(ChatCitation.message_id == assistant_id).delete(synchronize_session=False)
         saved = []
         for order, citation in enumerate(dedupe_citations(citations)):
+            retrieved_at = now_local()
             row = ChatCitation(message_id=assistant_id, source_type=citation["source_type"],
                                document_id=citation.get("document_id"), chunk_id=citation.get("chunk_id"),
                                title=citation["title"], source_url=citation.get("source_url") or None,
                                snippet=citation.get("snippet") or None, page_no=citation.get("page_no"),
                                tool_name=citation.get("tool_name") or None, sort_order=order,
-                               retrieved_at=now_local())
+                               retrieved_at=retrieved_at)
             db.add(row)
             db.flush()
-            saved.append({**citation, "citation_id": row.id, "sort_order": order})
+            saved.append({**citation, "citation_id": row.id, "sort_order": order,
+                          "retrieved_at": fmt_dt(retrieved_at)})
         session = db.get(ChatSession, message.session_id)
         if session:
             session.last_message_at = now_local()
@@ -261,6 +273,10 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
                 contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
         fallback_citations = [citation_from_context(db, item) for item in contexts]
         if contexts or enable_web or enable_db_tool:
+            user_context = {
+                **user_context,
+                "pending_action_token": get_pending_action_token(db, user_context) or "",
+            }
             payload = {
                 "question": question, "contexts": contexts, "history": history,
                 "enable_web": enable_web, "enable_db_tool": enable_db_tool,

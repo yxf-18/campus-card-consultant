@@ -9,8 +9,10 @@ from app.documents import chunk_document, parse_document
 from app.embeddings import hash_embedding
 from app.main import app, chat_events
 from app.providers import (build_answer, build_web_query, classify_question, make_suggestions,
-                           parse_so_results, rank_web_results, safe_refusal,
-                           small_talk_response, _chat_messages)
+                           format_tool_answer, parse_so_results, plan_tool_requests,
+                           rank_web_results, safe_refusal,
+                           small_talk_response, _chat_messages, _extract_published_date,
+                           _web_source_footer)
 from app.schemas import ChatPayload
 from app.vector_store import LocalVectorStore
 from pathlib import Path
@@ -43,7 +45,7 @@ def test_local_vector_store_version_filter():
 
 
 def test_safety_refusal_and_internal_auth():
-    assert safe_refusal("帮我充值一百元")
+    assert safe_refusal("帮我退款到银行卡")
     client = TestClient(app)
     docs = client.get("/docs")
     assert docs.status_code == 200
@@ -102,6 +104,46 @@ def test_web_query_rewrite_and_result_filtering():
     assert "优惠" in ranked[0]["title"]
 
 
+def test_official_web_results_filter_telecom_and_require_dates():
+    question = "今天学校官网有什么最新的校园卡优惠？"
+    ranked = rank_web_results(question, [
+        {
+            "title": "北京校园卡，2026年主流资费一览",
+            "url": "https://example.com/mobile-plan",
+            "snippet": "校园卡每月60G流量，手机套餐支持新开办理。",
+        },
+        {
+            "title": "校园一卡通优惠通知",
+            "url": "https://card.example.edu.cn/notice",
+            "snippet": "校园一卡通充值活动通知",
+            "raw_content": "发布日期：2026-11-10 校园一卡通充值活动说明",
+        },
+    ])
+    assert ranked
+    assert ranked[0]["url"].endswith("card.example.edu.cn/notice")
+    assert ranked[0]["published"] == "2026-11-10"
+    assert ranked[0]["retrieved_at"]
+    assert _extract_published_date("https://example.edu.cn/2026/0712/page.htm") == "2026-07-12"
+    footer = _web_source_footer(ranked)
+    assert "信息来源" in footer and "检索日期" in footer
+    assert ranked[0]["url"] in footer and "2026-11-10" in footer
+
+
+def test_web_results_enter_the_final_model_prompt():
+    result = {
+        "title": "校园一卡通服务通知",
+        "url": "https://card.example.edu.cn/notice/1",
+        "snippet": "校园一卡通服务安排。",
+        "published": "2026-11-10",
+        "retrieved_at": "2026-11-12",
+    }
+    messages = _chat_messages("今天最新通知", [], [], [result], None)
+    system = messages[0]["content"]
+    assert "[网页1]" in system
+    assert result["url"] in system
+    assert "2026-11-10" in system
+
+
 def test_question_source_routing():
     doc = classify_question("校园卡丢失后怎么补办？")
     assert doc["use_knowledge"] and not doc["use_database"]
@@ -111,11 +153,64 @@ def test_question_source_routing():
     assert mixed["use_database"] and mixed["use_knowledge"]
     latest = classify_question("今天学校官网有什么最新优惠")
     assert latest["explicit_web"]
-    assert latest["use_knowledge"] is False
+    # 实时网页与本地政策资料可以同时作为依据，网页负责“最新”，RAG负责办理规则。
+    assert latest["use_knowledge"] is True
     greeting = classify_question("你好")
     assert greeting["use_knowledge"] is False
     assert greeting["use_database"] is False
     assert greeting["explicit_web"] is False
+
+
+def test_conversation_plans_read_and_two_stage_write_actions():
+    assert plan_tool_requests("这个月花了多少")[0]["tool_name"] == "aggregate_transactions"
+    loss = plan_tool_requests("我卡丢了")
+    assert loss == [{"tool_name": "prepare_action", "params": {"action_type": "loss"}}]
+    assert plan_tool_requests(
+        "好", user_context={"pending_action_token": "server-only-token"}
+    ) == [{"tool_name": "commit_action", "params": {}}]
+    compound = plan_tool_requests("先挂失，然后帮我预约后天下午的补办")
+    assert [item["params"]["action_type"] for item in compound] == ["loss", "reissue"]
+    assert compound[1]["params"]["preferred_slot"] == "afternoon"
+    reissue = plan_tool_requests("我要预约后天下午的补办")
+    assert reissue[0]["params"]["date"] == "relative:2d"
+    assert reissue[0]["params"]["preferred_slot"] == "afternoon"
+    assert reissue[0]["params"]["_auto_commit"] is True
+    privacy = plan_tool_requests("查一下别人的余额")
+    assert privacy[0]["tool_name"] == "conversation"
+    assert safe_refusal("我卡丢了") is None
+    assert safe_refusal("帮我充值 100 元") is None
+    assert safe_refusal("帮我退款") is not None
+
+
+def test_cloud_rag_database_and_web_sources_can_coexist():
+    route = classify_question("我的余额是多少，同时告诉我今天学校官网最新优惠")
+    assert route["use_database"] is True
+    assert route["use_knowledge"] is True
+    assert route["explicit_web"] is True
+    calls = plan_tool_requests("我的余额是多少，同时告诉我今天学校官网最新优惠")
+    assert any(call["tool_name"] == "get_balance" for call in calls)
+
+
+def test_personal_data_answers_use_backend_numbers_without_model_arithmetic():
+    forecast = {
+        "tool_name": "forecast_balance",
+        "result": {"ok": True, "data": {
+            "balance": "128.50", "window_days": 30, "daily_average": "159.22",
+            "support_days": 1, "threshold_date": "2026-11-12",
+            "suggested_recharge": "2120.58",
+        }},
+    }
+    answer = format_tool_answer(forecast)
+    assert "159.22" in answer and "2120.58" in answer
+    assert "290.67" not in answer
+    action = {
+        "tool_name": "commit_action",
+        "result": {"ok": True, "data": {"order": {
+            "order_no": "LOS-20261112-001", "type": "loss", "status": "submitted",
+        }}},
+    }
+    action_answer = format_tool_answer(action)
+    assert "挂失已提交" in action_answer and "已已" not in action_answer
 
 
 def test_small_talk_has_plain_language():

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import get_db
-from .models import SysUser, now_local
+from .models import SysUser
 from .responses import ApiError
 from .security import decode_access_token
 
@@ -39,8 +39,6 @@ def get_current_user(
         raise ApiError(100107, "用户不存在", 401)
     if user.status != "ACTIVE":
         raise ApiError(100103, "账号已禁用", 403)
-    if user.locked_until and user.locked_until > now_local():
-        raise ApiError(100102, "账号已被锁定，请稍后再试", 423)
     return user
 
 

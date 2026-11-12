@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
@@ -219,23 +220,23 @@ def test_admin_cannot_use_mobile_login_or_chat(client: TestClient):
     assert chat.status_code == 403
 
 
-def test_login_lockout_after_five_failures(client: TestClient):
+def test_login_wrong_password_can_retry_without_lockout(client: TestClient):
     username = "demo0001"
-    for _ in range(5):
+    for _ in range(6):
         failed = client.post("/api/v1/auth/login", json={
             "account": username, "password": "WrongPass123", "client_type": "MOBILE"})
         assert failed.status_code == 401
-        assert "账号或密码错误" in failed.json()["message"]
-    locked = client.post("/api/v1/auth/login", json={
+        assert failed.json()["message"] == "账号或密码错误，请重试"
+    retried = client.post("/api/v1/auth/login", json={
         "account": username, "password": "Student123", "client_type": "MOBILE"})
-    assert locked.status_code == 423
-    assert locked.json()["code"] == 100102
+    assert retried.status_code == 200
 
 
 def test_explicit_web_question_skips_document_retrieval():
     from app.routers.chat import is_web_first_question
 
-    assert is_web_first_question("今天学校官网有什么最新优惠", True)
+    assert not is_web_first_question("今天学校官网有什么最新优惠", True)
+    assert is_web_first_question("今天有什么最新校园卡服务通知", True)
     assert not is_web_first_question("校园卡丢失后怎么补办", True)
     assert not is_web_first_question("今天学校官网有什么最新优惠", False)
 
@@ -527,3 +528,122 @@ def test_seed_fills_every_category_and_demo_workspace(client: TestClient):
     stats = client.get("/api/v1/admin/statistics/overview", headers=admin_headers,
                        params={"start_date": today, "end_date": "2026-12-31"}).json()["data"]
     assert stats["qa"]["total"] >= 1
+
+
+def test_conversation_read_tools_are_scoped_to_current_user(client: TestClient):
+    token = login(client, "student", "Student123", "MOBILE")
+    user = client.get("/api/v1/auth/me", headers=auth_headers(token)).json()["data"]["user"]
+    context = {"user_id": user["user_id"], "role": "USER", "student_no": user["student_no"]}
+    headers = {"X-Internal-Token": "test-internal"}
+    aggregate = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "aggregate_transactions",
+        "params": {"range": "this_month", "group_by": "category", "direction": "out"},
+        "user_context": context,
+    })
+    assert aggregate.status_code == 200, aggregate.text
+    data = aggregate.json()["result"]
+    assert data["ok"] is True
+    assert Decimal(data["data"]["total_amount"]) >= 0
+    assert data["data"]["items"]
+
+    denied = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "get_balance",
+        "params": {"student_no": "01"},
+        "user_context": context,
+    })
+    assert denied.status_code == 200
+    denied_data = denied.json()["result"]
+    assert denied_data["ok"] is False
+    assert denied_data["error_code"] == "PRIVACY_OR_ACCOUNT"
+
+
+def test_conversation_two_stage_loss_reissue_and_token_reuse(client: TestClient):
+    from app.database import SessionLocal
+    from app.models import CampusCardAccount, SysUser
+    from app.security import hash_password
+
+    username = f"conversation_{uuid.uuid4().hex[:8]}"
+    db = SessionLocal()
+    try:
+        user = SysUser(
+            username=username, nickname="对话办理测试", student_no=f"S{uuid.uuid4().hex[:8]}",
+            password_hash=hash_password("Student123"), role="USER", status="ACTIVE",
+        )
+        db.add(user)
+        db.flush()
+        account = CampusCardAccount(
+            user_id=user.id, card_no=f"TEST{uuid.uuid4().hex[:16].upper()}",
+            balance=Decimal("100.00"), status="ACTIVE",
+        )
+        db.add(account)
+        db.commit()
+        user_id = user.id
+        student_no = user.student_no
+    finally:
+        db.close()
+
+    context = {"user_id": user_id, "role": "USER", "student_no": student_no}
+    headers = {"X-Internal-Token": "test-internal"}
+
+    prepared = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "prepare_action",
+        "params": {"action_type": "loss"},
+        "user_context": context,
+    }).json()["result"]
+    assert prepared["ok"] is True
+    token = prepared["data"]["confirm_token"]
+    loss_order = prepared["data"]["order"]["order_no"]
+
+    committed = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "commit_action",
+        "params": {"confirm_token": token},
+        "user_context": context,
+    }).json()["result"]
+    assert committed["ok"] is True
+    assert committed["data"]["order"]["status"] == "submitted"
+
+    duplicate_loss = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "prepare_action",
+        "params": {"action_type": "loss"},
+        "user_context": context,
+    }).json()["result"]
+    assert duplicate_loss["ok"] is True
+    assert duplicate_loss["data"]["duplicate"] is True
+    assert duplicate_loss["data"]["order"]["order_no"] == loss_order
+
+    reused = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "commit_action",
+        "params": {"confirm_token": token},
+        "user_context": context,
+    }).json()["result"]
+    assert reused["ok"] is False
+    assert reused["error_code"] == "TOKEN_USED"
+
+    recharge = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "prepare_action",
+        "params": {"action_type": "recharge", "amount": "50.00"},
+        "user_context": context,
+    }).json()["result"]
+    assert recharge["ok"] is False
+    assert recharge["error_code"] == "INVALID_CARD_STATE"
+
+    reissue = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "prepare_action",
+        "params": {"action_type": "reissue", "date": "relative:2d"},
+        "user_context": context,
+    }).json()["result"]
+    assert reissue["ok"] is True, reissue
+    reissue_commit = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "commit_action",
+        "params": {"confirm_token": reissue["data"]["confirm_token"]},
+        "user_context": context,
+    }).json()["result"]
+    assert reissue_commit["ok"] is True
+
+    status = client.post("/internal/v1/tools/query", headers=headers, json={
+        "tool_name": "query_order_status",
+        "params": {"order_no": loss_order},
+        "user_context": context,
+    }).json()["result"]
+    assert status["ok"] is True
+    assert status["data"]["order"]["events"]

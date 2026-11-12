@@ -13,6 +13,11 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
+from ..conversation_service import (
+    aggregate_transactions, cancel_action, cancel_order,
+    commit_action, compare_periods, forecast_balance, get_balance, handle_conversation,
+    list_subsidy_records, prepare_action, query_order_status, query_transactions,
+)
 from ..database import get_db
 from ..dependencies import require_admin, require_internal_token
 from ..models import (CampusCardAccount, ChatFeedback, ChatMessage, KnowledgeCategory,
@@ -324,8 +329,36 @@ def export_statistics(payload: ExportRequest, _admin: SysUser = Depends(require_
 @internal_router.post("/tools/query")
 def internal_tool_query(payload: InternalToolRequest, _: None = Depends(require_internal_token),
                         db: Session = Depends(get_db)):
+    context = payload.user_context or {}
+    params = dict(payload.params or {})
+    tool_servers = {
+        "get_balance": get_balance,
+        "query_transactions": query_transactions,
+        "aggregate_transactions": aggregate_transactions,
+        "compare_periods": compare_periods,
+        "list_subsidy_records": list_subsidy_records,
+        "forecast_balance": forecast_balance,
+        "query_order_status": query_order_status,
+        "cancel_order": cancel_order,
+    }
+    if payload.tool_name in tool_servers:
+        result = tool_servers[payload.tool_name](db, context, params)
+        return {"result": result}
+    if payload.tool_name == "conversation":
+        result = handle_conversation(db, payload.question, context, params)
+        return {"result": result}
+    if payload.tool_name in {"prepare_action", "commit_action", "cancel_action"}:
+        if payload.tool_name == "prepare_action":
+            auto_commit = bool(params.pop("_auto_commit", params.pop("auto_commit", False)))
+            result = prepare_action(db, context, str(params.pop("action_type", "")), params)
+            if auto_commit and result.get("ok") and result.get("data", {}).get("confirm_token"):
+                result = commit_action(db, context, result["data"]["confirm_token"])
+            return {"result": result}
+        token = str(params.pop("confirm_token", "") or context.get("pending_action_token", ""))
+        if payload.tool_name == "commit_action":
+            return {"result": commit_action(db, context, token, params)}
+        return {"result": cancel_action(db, context, token, params)}
     if payload.tool_name == "get_card_balance":
-        context = payload.user_context or {}
         requester_id = context.get("user_id")
         role = context.get("role")
         requested_student_no = str(payload.params.get("student_no", "")).strip()

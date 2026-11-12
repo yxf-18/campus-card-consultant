@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import timedelta
-
 from fastapi import APIRouter, Depends
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -12,7 +10,7 @@ from ..models import ProfileChangeRequest, SysUser, now_local
 from ..responses import ApiError, success
 from ..schemas import LoginRequest, ProfileUpdateRequest
 from ..security import create_access_token, revoke_token, verify_password
-from ..services import get_int_config, identity_conflict
+from ..services import identity_conflict
 from ..utils import fmt_dt
 
 router = APIRouter(prefix="/auth", tags=["认证"])
@@ -69,26 +67,12 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     if user.status != "ACTIVE":
         raise ApiError(100103, "账号已被禁用，请联系管理员", 403)
     now = now_local()
-    if user.locked_until and user.locked_until > now:
-        raise ApiError(100102, "账号已被锁定，请稍后再试", 423)
-    if user.locked_until and user.locked_until <= now:
-        user.locked_until = None
-        user.failed_login_count = 0
     if not verify_password(payload.password, user.password_hash):
-        user.failed_login_count += 1
-        limit = get_int_config(db, "auth.login_fail_limit", 5)
-        lock_minutes = get_int_config(db, "auth.login_lock_minutes", 10)
-        if user.failed_login_count >= limit:
-            user.locked_until = now + timedelta(minutes=lock_minutes)
-            user.failed_login_count = 0
-        db.commit()
-        raise ApiError(100101, "账号或密码错误，请检查后重试", 401)
+        raise ApiError(100101, "账号或密码错误，请重试", 401)
     if payload.client_type == "MOBILE" and user.role != "USER":
         raise ApiError(100201, "管理员账号不能登录移动端", 403)
     if payload.client_type == "ADMIN" and user.role != "ADMIN":
         raise ApiError(100201, "普通用户不能登录管理后台", 403)
-    user.failed_login_count = 0
-    user.locked_until = None
     user.last_login_at = now
     db.commit()
     token, expires_in = create_access_token(user.id, user.username, user.role)

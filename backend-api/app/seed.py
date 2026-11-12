@@ -7,6 +7,8 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from .config import get_settings
+from .card_read_service import seed_card_read_data
+from .conversation_models import seed_conversation_data
 from .database import SessionLocal, init_db
 from .models import (CampusCardAccount, ChatFeedback, ChatMessage, ChatSession, KnowledgeCategory,
                      KnowledgeDocument, ProfileChangeRequest, SysConfig, SysUser, now_local)
@@ -45,10 +47,15 @@ SEED_DOCUMENTS = [
     ("校园卡临时优惠活动规则.md", "校园卡临时优惠活动规则", "优惠政策", "临时活动的参与、叠加与失效"),
     ("校园卡常见报错与处理.md", "校园卡常见报错与处理", "常见问题", "刷卡失败、余额不同步等报错处理"),
     ("校园卡余额与流水不一致怎么办.md", "校园卡余额与流水不一致怎么办", "常见问题", "余额流水不一致的核查与申诉"),
+    ("补助与助学金入账说明.md", "补助与助学金入账说明", "消费管理", "补助、助学金入账识别与核对方式"),
 ]
 
 
 def seed_configs(db: Session) -> None:
+    # 从旧版本升级时清理已废弃的登录锁定配置，管理后台不再显示相关项。
+    db.query(SysConfig).filter(SysConfig.config_key.in_([
+        "auth.login_fail_limit", "auth.login_lock_minutes",
+    ])).delete(synchronize_session=False)
     for key, group, value, value_type, description in DEFAULT_CONFIGS:
         row = db.query(SysConfig).filter(SysConfig.config_key == key).first()
         if row is None:
@@ -239,6 +246,10 @@ def seed_database(db: Session | None = None) -> None:
         seed_demo_activity(db)
         db.commit()
         seed_knowledge(db)
+        db.commit()
+        seed_card_read_data(db, months=6)
+        db.commit()
+        seed_conversation_data(db)
         db.commit()
     finally:
         if own_session:

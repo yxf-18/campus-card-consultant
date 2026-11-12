@@ -36,8 +36,6 @@ class SysUser(TimestampMixin, Base):
     nickname: Mapped[str] = mapped_column(String(50), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="USER")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
-    failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     privacy_agreed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     __table_args__ = (CheckConstraint("role IN ('USER','ADMIN')", name="ck_user_role"), CheckConstraint("status IN ('ACTIVE','DISABLED')", name="ck_user_status"))

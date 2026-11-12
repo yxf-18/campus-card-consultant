@@ -15,8 +15,8 @@ from fastapi.responses import StreamingResponse
 from .config import get_settings
 from .documents import chunk_document, parse_document
 from .embeddings import embedding_provider
-from .providers import (classify_question, core_tool, make_suggestions, safe_refusal,
-                        small_talk_response,
+from .providers import (classify_question, core_tool, format_tool_answer, make_suggestions,
+                        plan_tool_requests, safe_refusal, small_talk_response,
                         stream_llm, tavily_search, tool_has_evidence)
 from .schemas import ChatPayload, RetrieveRequest, SummarizeRequest, UnindexRequest
 from .vector_store import vector_store
@@ -136,14 +136,26 @@ async def chat_events(payload: ChatPayload):
                        "guard": {"is_grounded": False, "reason": "账户操作仅提供办理指引"}}
         return
 
-    route = classify_question(payload.question)
+    route = classify_question(payload.question, payload.history, payload.user_context)
     selected_contexts = payload.contexts if route["use_knowledge"] else []
     tool_result: dict[str, Any] | None = None
     web_results: list[dict[str, Any]] = []
 
     if route["use_database"] and payload.enable_db_tool:
-        tool_result = await core_tool(payload.question, payload.user_context,
-                                      route["db_tool"], route["params"])
+        calls = plan_tool_requests(payload.question, payload.history, payload.user_context)
+        operation_results: list[dict[str, Any]] = []
+        for call in calls:
+            result = await core_tool(payload.question, payload.user_context,
+                                     call["tool_name"], call.get("params", {}))
+            if result is not None:
+                operation_results.append(result)
+        if len(operation_results) == 1:
+            tool_result = operation_results[0]
+        elif operation_results:
+            tool_result = {
+                "tool_name": "conversation",
+                "result": {"ok": True, "data": {"operations": operation_results}},
+            }
 
     # 越权查询他人余额时直接说明隐私规则，不继续检索网页或知识库，避免把无关信息拼进回答。
     if tool_result and isinstance(tool_result.get("result"), dict) and tool_result["result"].get("denied"):
@@ -175,7 +187,9 @@ async def chat_events(payload: ChatPayload):
     for item in web_results:
         citations.append({"source_type": "WEB", "document_id": None, "chunk_id": None,
                           "title": item.get("title") or "网页资料", "source_url": item.get("url") or "",
-                          "snippet": item.get("snippet") or "", "page_no": None})
+                         "snippet": item.get("snippet") or "", "page_no": None,
+                         "published": item.get("published") or "",
+                         "retrieved": item.get("retrieved_at") or ""})
     if citations:
         yield "citation", {"citations": citations}
 
@@ -186,10 +200,15 @@ async def chat_events(payload: ChatPayload):
             yield "delta", {"content": text[index:index + 20]}
         grounded = False
     else:
-        async for piece in stream_llm(payload.question, selected_contexts, payload.history,
-                                      web_results, tool_result):
-            if piece:
-                yield "delta", {"content": piece}
+        direct_answer = format_tool_answer(tool_result, selected_contexts, payload.question)
+        if direct_answer and not web_results:
+            for index in range(0, len(direct_answer), 20):
+                yield "delta", {"content": direct_answer[index:index + 20]}
+        else:
+            async for piece in stream_llm(payload.question, selected_contexts, payload.history,
+                                          web_results, tool_result):
+                if piece:
+                    yield "delta", {"content": piece}
         grounded = bool(citations)
 
     suggestions = make_suggestions(payload.question, selected_contexts)

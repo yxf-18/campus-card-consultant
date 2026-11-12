@@ -61,7 +61,7 @@ async function submit(){
     <van-dialog v-model:show="helpVisible" title="登录帮助" confirm-button-text="知道了">
       <div class="help-body">
         <p>账号由学校统一开通，系统不提供自助注册，数据库里没有账号无法登录。</p>
-        <p>忘记密码或账号被锁定，请携带本人证件联系学校卡务中心重置；锁定通常会在若干分钟后自动解除。</p>
+        <p>账号或密码输入错误时可以直接重试；忘记密码请携带本人证件联系学校卡务中心重置。</p>
         <p>手机号、邮箱修改需要管理员审核通过后才会生效，审核期间原信息继续有效。</p>
       </div>
     </van-dialog>
