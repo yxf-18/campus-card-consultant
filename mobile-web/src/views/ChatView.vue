@@ -3,8 +3,8 @@ import { computed,nextTick,onBeforeUnmount,onMounted,ref } from 'vue'
 import { useRoute,useRouter } from 'vue-router'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { showFailToast } from 'vant'
-import { sessionApi } from '@/api'
+import { showFailToast,showSuccessToast } from 'vant'
+import { chatApi,sessionApi } from '@/api'
 import type { ChatMessage } from '@/types'
 import { streamChat } from '@/utils/sse'
 const route=useRoute();const router=useRouter()
@@ -14,6 +14,7 @@ const loading=ref(false)
 const streaming=ref(false)
 const scroller=ref<HTMLDivElement>()
 const controller=ref<AbortController|null>(null)
+const feedbackLoading=ref<number|null>(null)
 const sessionId=ref<number|undefined>(route.params.sessionId?Number(route.params.sessionId):undefined)
 const documentId=ref<number|undefined>(route.query.document_id?Number(route.query.document_id):undefined)
 const welcome=computed(()=>messages.value.length===0)
@@ -58,6 +59,19 @@ async function send(text?:string){
 }
 function stop(){controller.value?.abort()}
 function onAction(){if(streaming.value)stop();else send()}
+async function submitFeedback(message:ChatMessage,rating:'LIKE'|'DISLIKE'){
+  if(!message.message_id||message.feedback||feedbackLoading.value)return
+  feedbackLoading.value=message.message_id
+  try{
+    const response=await chatApi.feedback(message.message_id,{rating})
+    message.feedback={rating:response.data.data.rating,status:response.data.data.status}
+    showSuccessToast('感谢您的反馈')
+  }catch(e){
+    showFailToast((e as Error).message)
+  }finally{
+    feedbackLoading.value=null
+  }
+}
 onMounted(load)
 onBeforeUnmount(()=>controller.value?.abort())
 </script>
@@ -85,6 +99,16 @@ onBeforeUnmount(()=>controller.value?.abort())
             <div v-if="message.role==='ASSISTANT'&&message.suggestions?.length&&!streaming" class="cc-suggestions">
               <p>你还可以问</p>
               <button v-for="item in message.suggestions" :key="item" @click="send(item)">{{item}}</button>
+            </div>
+            <div v-if="message.role==='ASSISTANT'&&message.message_id&&message.status==='SUCCESS'&&!streaming" class="cc-feedback">
+              <template v-if="message.feedback">
+                <span class="cc-feedback-done">{{message.feedback.rating==='LIKE'?'已反馈：有用':'已反馈：没帮助'}}</span>
+              </template>
+              <template v-else>
+                <span>这个回答有帮助吗？</span>
+                <button type="button" :disabled="feedbackLoading!==null" @click="submitFeedback(message,'LIKE')">{{feedbackLoading===message.message_id?'提交中':'有用'}}</button>
+                <button type="button" :disabled="feedbackLoading!==null" @click="submitFeedback(message,'DISLIKE')">没帮助</button>
+              </template>
             </div>
           </div>
         </div>
@@ -122,6 +146,11 @@ onBeforeUnmount(()=>controller.value?.abort())
 @keyframes cc-blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
 .cc-suggestions{margin-top:12px;padding-top:10px;border-top:1px dashed #e4eef0}.cc-suggestions p{margin:0 0 7px;font-size:10px;color:#93a4ad}
 .cc-suggestions button{display:block;width:100%;text-align:left;border:1px solid #dcebe8;background:#f7fcfb;border-radius:11px;padding:9px 11px;margin-bottom:6px;color:#2b5a60;font-size:12px}
+.cc-feedback{display:flex;align-items:center;gap:7px;margin-top:10px;padding-top:9px;border-top:1px dashed #e4eef0;color:#8497a5;font-size:11px}
+.cc-feedback button{border:1px solid #d7e7e5;background:#f8fcfb;color:#2b5a60;border-radius:9px;padding:4px 9px;font-size:11px}
+.cc-feedback button:hover{border-color:#8bc1ba;background:#eef8f6}
+.cc-feedback button:disabled{opacity:.5}
+.cc-feedback-done{color:#187a5a;background:#e8f6f0;border-radius:999px;padding:4px 9px}
 .cc-input-bar{flex:0 0 auto;display:flex;gap:9px;align-items:flex-end;padding:10px 14px calc(12px + env(safe-area-inset-bottom));background:white;border-top:1px solid #e1ebee}
 .cc-input{flex:1;background:#f4f8fa;border-radius:15px;padding:4px 10px;max-height:110px;overflow-y:auto}
 .cc-send{border:0;border-radius:14px;background:#0f7c73;color:white;font-size:14px;padding:11px 16px;flex:0 0 auto}

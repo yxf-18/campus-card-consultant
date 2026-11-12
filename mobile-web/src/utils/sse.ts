@@ -13,19 +13,24 @@ export async function streamChat(body: Record<string, unknown>, onEvent: (event:
   }
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''
   const newline = String.fromCharCode(10)
+  const emitFrame = (frame: string) => {
+    let event = 'message'; const dataLines: string[] = []
+    for (const line of frame.split(newline)) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+    }
+    if (!dataLines.length) return
+    try { onEvent({ event, data: JSON.parse(dataLines.join(newline)) }) } catch { /* ignore malformed frame */ }
+  }
   while (true) {
     const { done, value } = await reader.read()
-    if (done) break
+    if (done) {
+      buffer += decoder.decode()
+      break
+    }
     buffer += decoder.decode(value, { stream: true })
     const frames = buffer.split(newline + newline); buffer = frames.pop() || ''
-    for (const frame of frames) {
-      let event = 'message'; const dataLines: string[] = []
-      for (const line of frame.split(newline)) {
-        if (line.startsWith('event:')) event = line.slice(6).trim()
-        if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
-      }
-      if (!dataLines.length) continue
-      try { onEvent({ event, data: JSON.parse(dataLines.join(newline)) }) } catch { /* ignore malformed frame */ }
-    }
+    for (const frame of frames) emitFrame(frame)
   }
+  if (buffer.trim()) emitFrame(buffer)
 }

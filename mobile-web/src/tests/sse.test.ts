@@ -11,4 +11,13 @@ describe('streamChat', () => {
     expect(events.map(event => event.event)).toEqual(['delta', 'done'])
     expect(events[0].data.content).toBe('你好')
   })
+
+  it('parses a final done event without a trailing blank line', async () => {
+    const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('event: delta\ndata: {"content":"你好"}\n\nevent: done\ndata: {"message_id":9,"session_id":3}')); controller.close() } })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 200 })))
+    const events: any[] = []
+    await streamChat({ question: 'test' }, event => events.push(event))
+    expect(events.map(event => event.event)).toEqual(['delta', 'done'])
+    expect(events[1].data.message_id).toBe(9)
+  })
 })

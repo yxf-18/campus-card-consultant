@@ -5,6 +5,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -14,6 +15,80 @@ from .config import get_settings
 settings = get_settings()
 SAFE_REFUSAL_PHRASES = ("帮我充值", "替我充值", "帮我挂失", "替我挂失", "冻结我的卡", "解冻我的卡",
                         "帮我退款", "替我退款")
+WEB_FOCUS_TERMS = (
+    "校园卡", "一卡通", "充值", "补办", "挂失", "解挂", "消费", "余额", "优惠",
+    "校园码", "门禁", "图书馆", "食堂", "卡务", "退款", "账单", "流水",
+)
+WEB_CONVERSATIONAL_PHRASES = (
+    "请帮我查一下", "帮我查一下", "请帮我", "帮我", "我想知道", "我想问一下",
+    "请问一下", "请问", "告诉我", "能不能", "可以帮我", "查一下", "查查",
+    "有什么", "有哪些",
+)
+
+
+def build_web_query(question: str) -> str:
+    """Turn a conversational request into a concise, domain-specific search query."""
+    query = (question or "").strip()
+    for phrase in WEB_CONVERSATIONAL_PHRASES:
+        query = query.replace(phrase, " ")
+    query = re.sub(r"[\r\n\t]+", " ", query)
+    query = re.sub(r"[，。！？!?,；;：:]+", " ", query)
+    query = re.sub(r"\s+", " ", query).strip()
+    if not any(term in query for term in ("校园卡", "一卡通", "卡务")):
+        query = f"校园卡 {query}".strip()
+    if any(word in query for word in ("最新", "今年", "实时", "新闻")):
+        year = str(datetime.now().year)
+        if year not in query:
+            query = f"{query} {year}"
+    if settings.search_site_domain:
+        query = f"{query} site:{settings.search_site_domain}"
+    return query[:120] or "校园卡 最新信息"
+
+
+def _search_bigrams(text: str) -> set[str]:
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", (text or "").lower())
+    return {normalized[index:index + 2] for index in range(max(0, len(normalized) - 1))}
+
+
+def rank_web_results(question: str, results: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    """Deduplicate and rank search results, dropping unrelated pages."""
+    query = build_web_query(question)
+    query_bigrams = _search_bigrams(query)
+    requested_terms = [term for term in WEB_FOCUS_TERMS if term in question]
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for item in results:
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not title or not url:
+            continue
+        dedupe_key = (url.split("#", 1)[0] or title).lower()
+        if dedupe_key in seen:
+            continue
+        corpus = f"{title} {snippet}".lower()
+        term_hits = sum(term in corpus for term in requested_terms)
+        core_hit = any(term in corpus for term in ("校园卡", "一卡通", "卡务"))
+        overlap = len(query_bigrams & _search_bigrams(corpus)) / max(1, len(query_bigrams))
+        authoritative = url.startswith("https://") and any(
+            token in url.lower() for token in (".edu.cn", ".gov.cn")
+        )
+        # This is a campus-card assistant. Search snippets that never mention
+        # campus card, 一卡通 or card services are too often unrelated offers.
+        if not core_hit:
+            continue
+        seen.add(dedupe_key)
+        score = term_hits * 5 + overlap * 4 + (2 if authoritative else 0)
+        normalized = {
+            "title": title,
+            "url": url,
+            "snippet": re.sub(r"\s+", " ", snippet)[:500],
+        }
+        if item.get("published"):
+            normalized["published"] = item["published"]
+        ranked.append((score, normalized))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in ranked[:limit]]
 
 
 def parse_so_results(page: str) -> list[dict[str, Any]]:
@@ -34,25 +109,27 @@ def parse_so_results(page: str) -> list[dict[str, Any]]:
 
 async def so_search(question: str) -> list[dict[str, Any]]:
     """Chinese Web Search fallback without an API key."""
+    query = build_web_query(question)
     try:
         async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
             response = await client.get(
-                "https://www.so.com/s", params={"q": question},
+                "https://www.so.com/s", params={"q": query},
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CampusCardConsultant/1.0"},
             )
         response.raise_for_status()
-        return parse_so_results(response.text)
+        return rank_web_results(question, parse_so_results(response.text))
     except Exception:
         return []
 
 
 async def bing_rss_search(question: str) -> list[dict[str, Any]]:
     """No-key Web Search fallback using Bing's public RSS result format."""
+    query = build_web_query(question)
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             response = await client.get(
                 "https://www.bing.com/search",
-                params={"q": question, "format": "rss", "setlang": "zh-cn", "cc": "cn"},
+                params={"q": query, "format": "rss", "setlang": "zh-cn", "cc": "cn"},
                 headers={"User-Agent": "Mozilla/5.0 CampusCardConsultant/1.0"},
             )
         response.raise_for_status()
@@ -64,22 +141,31 @@ async def bing_rss_search(question: str) -> list[dict[str, Any]]:
             description = html.unescape(re.sub(r"<[^>]+>", " ", item.findtext("description") or ""))
             description = re.sub(r"\s+", " ", description).strip()
             if link and title:
-                results.append({"title": title, "url": link, "snippet": description[:500]})
-        return results[:3]
+                results.append({
+                    "title": title,
+                    "url": link,
+                    "snippet": description[:500],
+                    "published": (item.findtext("pubDate") or "").strip(),
+                })
+        return rank_web_results(question, results)
     except Exception:
         return []
 
 
 async def tavily_search(question: str) -> list[dict[str, Any]]:
+    query = build_web_query(question)
     if settings.search_provider == "tavily" and settings.tavily_api_key:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 response = await client.post("https://api.tavily.com/search", json={
-                    "api_key": settings.tavily_api_key, "query": question,
-                    "max_results": 3, "search_depth": "basic", "include_answer": False})
+                    "api_key": settings.tavily_api_key, "query": query,
+                    "max_results": 5, "search_depth": "advanced", "include_answer": False})
             response.raise_for_status()
             results = [{"title": item.get("title", "网页资料"), "url": item.get("url", ""),
-                        "snippet": item.get("content", "")} for item in response.json().get("results", [])[:3]]
+                        "snippet": item.get("content", ""),
+                        "published": item.get("published_date", "")}
+                       for item in response.json().get("results", [])[:5]]
+            results = rank_web_results(question, results)
             if results:
                 return results
         except Exception:
@@ -95,6 +181,25 @@ DOCUMENT_HINTS = (
     "充值方式", "充值", "消费", "优惠", "办理", "材料", "注意事项", "常见问题",
 )
 FRESHNESS_HINTS = ("最新", "实时", "今天", "今日", "今年", "新闻", "官网", "联网", "网上查询")
+
+GREETING_WORDS = {"你好", "您好", "嗨", "在吗", "早上好", "上午好", "下午好", "晚上好", "hello", "hi"}
+THANKS_WORDS = {"谢谢", "谢谢你", "多谢", "感谢"}
+BYE_WORDS = {"再见", "拜拜", "bye"}
+
+
+def small_talk_response(question: str) -> str | None:
+    """Respond naturally to greetings without running knowledge retrieval."""
+    normalized = re.sub(r"[\s，。！？!?,.~～]+", "", question or "").lower()
+    if normalized in GREETING_WORDS:
+        return (
+            "你好，我是校园卡智能助手。你可以直接问我校园卡充值、挂失补办、消费、"
+            "优惠、使用指南或本人余额等问题。"
+        )
+    if normalized in THANKS_WORDS:
+        return "不客气。如果还有校园卡使用或办理方面的问题，可以继续问我。"
+    if normalized in BYE_WORDS:
+        return "再见，祝你校园生活顺利。如需了解校园卡业务，欢迎再次咨询。"
+    return None
 
 
 def db_tool_request(question: str) -> tuple[str | None, dict[str, Any], str | None]:
@@ -117,11 +222,20 @@ def db_tool_request(question: str) -> tuple[str | None, dict[str, Any], str | No
 
 
 def classify_question(question: str) -> dict[str, Any]:
+    if small_talk_response(question):
+        return {
+            "use_knowledge": False,
+            "use_database": False,
+            "db_tool": None,
+            "params": {},
+            "db_domain": None,
+            "explicit_web": False,
+        }
     tool_name, params, db_domain = db_tool_request(question)
     document_hint = any(word in question for word in DOCUMENT_HINTS)
     explicit_web = any(word in question for word in FRESHNESS_HINTS)
     return {
-        "use_knowledge": document_hint or tool_name is None,
+        "use_knowledge": (document_hint or tool_name is None) and not explicit_web,
         "use_database": tool_name is not None,
         "db_tool": tool_name,
         "params": params,
@@ -321,13 +435,19 @@ def _chat_messages(question: str, contexts: list[dict], history: list[dict], web
     for index, item in enumerate(contexts[:5], start=1):
         sources.append(f"[资料{index}] {item.get('title', '')}\n{item.get('snippet', '')}")
     for index, item in enumerate(web_results, start=1):
-        sources.append(f"[网页{index}] {item.get('title', '')}\n{item.get('snippet', '')}\n{item.get('url', '')}")
+        published = f"\n发布时间：{item.get('published', '')}" if item.get("published") else ""
+        sources.append(
+            f"[网页{index}] {item.get('title', '')}\n"
+            f"{item.get('snippet', '')}\n{item.get('url', '')}{published}"
+        )
     if tool_result:
         sources.append("[系统工具] " + json.dumps(tool_result.get("result"), ensure_ascii=False))
     system = (
         "你是校园一卡通使用咨询助手。只能依据给定资料回答，不得编造金额、电话、时限或政策。"
         "涉及充值、挂失、退款等账户操作时只提供办理指引，不承诺代为执行。"
         "资料不足时必须明确说明，并建议联系学校正式渠道。回答简洁、使用中文。\n"
+        "联网资料只能采用与用户问题直接相关的内容，优先学校官网、政府部门或权威机构；"
+        "不要把搜索摘要当作正式政策原文，无法确认时明确说明。\n"
         "输出要求：用自然语言直接回答，不要输出[资料1]这类引用编号，不要列出参考来源，"
         "不要输出 JSON、字段名、参数名或接口路径；涉及金额时写成“128.50 元”。\n\n"
         "可用资料：\n" + "\n\n".join(sources)

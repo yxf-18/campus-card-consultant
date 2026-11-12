@@ -8,8 +8,9 @@ from fastapi.testclient import TestClient
 from app.documents import chunk_document, parse_document
 from app.embeddings import hash_embedding
 from app.main import app, chat_events
-from app.providers import (build_answer, classify_question, make_suggestions, parse_so_results,
-                           safe_refusal, _chat_messages)
+from app.providers import (build_answer, build_web_query, classify_question, make_suggestions,
+                           parse_so_results, rank_web_results, safe_refusal,
+                           small_talk_response, _chat_messages)
 from app.schemas import ChatPayload
 from app.vector_store import LocalVectorStore
 from pathlib import Path
@@ -83,6 +84,24 @@ def test_web_search_parser_and_three_source_defaults():
     assert payload.enable_db_tool is True
 
 
+def test_web_query_rewrite_and_result_filtering():
+    query = build_web_query("请问今天学校官网有什么最新的校园卡优惠？")
+    assert "校园卡" in query
+    assert "请问" not in query
+    assert "有什么" not in query
+    ranked = rank_web_results(
+        "今天学校官网有什么最新的校园卡优惠？",
+        [
+            {"title": "例子2：校内导师", "url": "https://example.com/team", "snippet": "李薇、邱原"},
+            {"title": "校园卡充值说明", "url": "https://example.com/recharge", "snippet": "充值渠道说明"},
+            {"title": "学校最新校园卡优惠通知", "url": "https://school.edu.cn/card", "snippet": "校园卡优惠活动通知"},
+        ],
+    )
+    assert ranked
+    assert "例子2" not in ranked[0]["title"]
+    assert "优惠" in ranked[0]["title"]
+
+
 def test_question_source_routing():
     doc = classify_question("校园卡丢失后怎么补办？")
     assert doc["use_knowledge"] and not doc["use_database"]
@@ -92,6 +111,17 @@ def test_question_source_routing():
     assert mixed["use_database"] and mixed["use_knowledge"]
     latest = classify_question("今天学校官网有什么最新优惠")
     assert latest["explicit_web"]
+    assert latest["use_knowledge"] is False
+    greeting = classify_question("你好")
+    assert greeting["use_knowledge"] is False
+    assert greeting["use_database"] is False
+    assert greeting["explicit_web"] is False
+
+
+def test_small_talk_has_plain_language():
+    assert "校园卡智能助手" in small_talk_response("你好")
+    assert "不客气" in small_talk_response("谢谢")
+    assert small_talk_response("你好，校园卡怎么补办") is None
 
 
 def test_answer_uses_only_selected_sources():

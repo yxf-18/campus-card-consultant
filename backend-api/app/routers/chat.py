@@ -26,6 +26,12 @@ from ..utils import default_suggestions, fmt_dt, pagination
 
 router = APIRouter(prefix="/chat", tags=["AI问答与会话"])
 
+WEB_FIRST_HINTS = ("最新", "实时", "今天", "今日", "今年", "新闻", "官网", "联网", "网上查询")
+
+
+def is_web_first_question(question: str, enable_web: bool) -> bool:
+    return bool(enable_web and any(word in (question or "") for word in WEB_FIRST_HINTS))
+
 
 def get_owned_session(db: Session, session_id: int, user_id: int) -> ChatSession:
     session = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == user_id,
@@ -244,13 +250,15 @@ async def run_generation(assistant_id: int, session_id: int, question: str, docu
         top_k = get_int_config(db, "rag.top_k", 5)
         threshold = get_float_config(db, "rag.similarity_threshold", 0.12)
         versions = allowed_versions_for(db, document_id)
-        try:
-            contexts = await ai_client.retrieve(question, versions, top_k, threshold, document_id)
-            model_name = "ai-service-rag"
-        except Exception:
-            contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
-        if not contexts:
-            contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
+        contexts: list[dict[str, Any]] = []
+        if not is_web_first_question(question, enable_web):
+            try:
+                contexts = await ai_client.retrieve(question, versions, top_k, threshold, document_id)
+                model_name = "ai-service-rag"
+            except Exception:
+                contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
+            if not contexts:
+                contexts = local_retrieve(db, question, versions, top_k, document_id, threshold)
         fallback_citations = [citation_from_context(db, item) for item in contexts]
         if contexts or enable_web or enable_db_tool:
             payload = {

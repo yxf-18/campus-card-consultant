@@ -35,6 +35,7 @@ class Settings:
     llm_model: str
     llm_timeout_seconds: float
     search_provider: str
+    search_site_domain: str
     tavily_api_key: str
     data_dir: Path
 
@@ -62,5 +63,7 @@ def get_settings() -> Settings:
         embedding_api_key=os.getenv("EMBEDDING_API_KEY", ""), embedding_model=os.getenv("EMBEDDING_MODEL", ""),
         llm_base_url=os.getenv("LLM_BASE_URL", "").rstrip("/"), llm_api_key=os.getenv("LLM_API_KEY", ""),
         llm_model=os.getenv("LLM_MODEL", ""), llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
-        search_provider=os.getenv("SEARCH_PROVIDER", "none").lower(), tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
+        search_provider=os.getenv("SEARCH_PROVIDER", "none").lower(),
+        search_site_domain=os.getenv("SEARCH_SITE_DOMAIN", "").removeprefix("https://").removeprefix("http://").strip("/"),
+        tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
         data_dir=data_dir)

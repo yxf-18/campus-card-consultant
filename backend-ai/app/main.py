@@ -16,6 +16,7 @@ from .config import get_settings
 from .documents import chunk_document, parse_document
 from .embeddings import embedding_provider
 from .providers import (classify_question, core_tool, make_suggestions, safe_refusal,
+                        small_talk_response,
                         stream_llm, tavily_search, tool_has_evidence)
 from .schemas import ChatPayload, RetrieveRequest, SummarizeRequest, UnindexRequest
 from .vector_store import vector_store
@@ -111,6 +112,20 @@ def summarize(payload: SummarizeRequest):
 
 
 async def chat_events(payload: ChatPayload):
+    small_talk = small_talk_response(payload.question)
+    if small_talk:
+        for index in range(0, len(small_talk), 20):
+            yield "delta", {"content": small_talk[index:index + 20]}
+        suggestions = make_suggestions(payload.question, [])
+        yield "suggestion", {"suggestions": suggestions}
+        yield "done", {
+            "citations": [],
+            "suggestions": suggestions,
+            "guard": {"is_grounded": False, "reason": "日常问候"},
+            "sources_used": {"knowledge": False, "database": False, "web": False},
+        }
+        return
+
     refusal = safe_refusal(payload.question)
     if refusal:
         for index in range(0, len(refusal), 20):

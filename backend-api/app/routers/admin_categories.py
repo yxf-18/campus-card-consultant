@@ -6,7 +6,14 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..dependencies import require_admin
-from ..models import KnowledgeCategory, KnowledgeDocument, SysUser
+from ..models import (
+    ChatCitation,
+    KnowledgeCategory,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    RagSyncTask,
+    SysUser,
+)
 from ..responses import ApiError, success
 from ..schemas import CategoryCreateRequest, CategoryUpdateRequest
 from ..services import category_json
@@ -65,9 +72,52 @@ def delete_category(category_id: int, _admin: SysUser = Depends(require_admin), 
     category = db.get(KnowledgeCategory, category_id)
     if category is None:
         raise ApiError(200106, "分类不存在", 404)
-    count = db.query(KnowledgeDocument).filter(KnowledgeDocument.category_id == category_id).count()
-    if count:
-        raise ApiError(100105, "分类存在关联文档，请先迁移文档或停用分类", 409)
+    active_count = (
+        db.query(KnowledgeDocument)
+        .filter(
+            KnowledgeDocument.category_id == category_id,
+            KnowledgeDocument.is_deleted.is_(False),
+        )
+        .count()
+    )
+    if active_count:
+        raise ApiError(100105, "分类下仍有未删除文档，请先迁移或删除文档", 409)
+
+    # Logically deleted documents are no longer visible in the admin count.
+    # Purge those archived rows before deleting the category so the foreign key
+    # behavior matches the number shown in the UI.
+    archived_documents = (
+        db.query(KnowledgeDocument)
+        .filter(
+            KnowledgeDocument.category_id == category_id,
+            KnowledgeDocument.is_deleted.is_(True),
+        )
+        .all()
+    )
+    document_ids = [document.id for document in archived_documents]
+    if document_ids:
+        chunk_ids = [
+            row[0]
+            for row in db.query(KnowledgeChunk.id)
+            .filter(KnowledgeChunk.document_id.in_(document_ids))
+            .all()
+        ]
+        if chunk_ids:
+            db.query(ChatCitation).filter(ChatCitation.chunk_id.in_(chunk_ids)).update(
+                {ChatCitation.chunk_id: None}, synchronize_session=False
+            )
+        db.query(ChatCitation).filter(ChatCitation.document_id.in_(document_ids)).update(
+            {ChatCitation.document_id: None}, synchronize_session=False
+        )
+        db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id.in_(document_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(RagSyncTask).filter(RagSyncTask.document_id.in_(document_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(KnowledgeDocument).filter(KnowledgeDocument.id.in_(document_ids)).delete(
+            synchronize_session=False
+        )
     db.delete(category)
     db.commit()
     return success({"result": True})

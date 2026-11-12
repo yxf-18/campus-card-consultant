@@ -130,6 +130,56 @@ def test_admin_category_and_config_management(client: TestClient):
     assert "管理员账号不能被禁用" in protected.json()["message"]
 
 
+def test_disabled_empty_category_with_archived_document_can_be_deleted(client: TestClient):
+    token = login(client, "admin", "Admin12345")
+    headers = auth_headers(token)
+    name = f"归档分类_{uuid.uuid4().hex[:6]}"
+    created = client.post(
+        "/api/v1/admin/categories",
+        headers=headers,
+        json={"name": name, "sort_order": 120, "status": "DISABLED"},
+    )
+    assert created.status_code == 201, created.text
+    category_id = created.json()["data"]["category"]["category_id"]
+
+    from app.database import SessionLocal
+    from app.models import KnowledgeCategory, KnowledgeDocument, SysUser, now_local
+
+    db = SessionLocal()
+    try:
+        admin = db.query(SysUser).filter(SysUser.username == "admin").first()
+        category = db.get(KnowledgeCategory, category_id)
+        document = KnowledgeDocument(
+            category_id=category.id,
+            title="已逻辑删除的归档文档",
+            summary="回归测试",
+            file_name="archived.md",
+            storage_path="uploads/archived.md",
+            file_type="md",
+            file_size=8,
+            status="OFFLINE",
+            created_by=admin.id,
+            updated_by=admin.id,
+            is_deleted=True,
+            deleted_at=now_local(),
+        )
+        db.add(document)
+        db.commit()
+    finally:
+        db.close()
+
+    categories = client.get(
+        "/api/v1/admin/categories", headers=headers, params={"page_size": 100}
+    ).json()["data"]["list"]
+    row = next(item for item in categories if item["category_id"] == category_id)
+    assert row["document_count"] == 0
+    assert row["status"] == "DISABLED"
+
+    deleted = client.delete(f"/api/v1/admin/categories/{category_id}", headers=headers)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["data"]["result"] is True
+
+
 def test_internal_card_balance_tool_and_privacy(client: TestClient):
     token = login(client, "student", "Student123")
     user = client.get("/api/v1/auth/me", headers=auth_headers(token)).json()["data"]["user"]
@@ -180,6 +230,14 @@ def test_login_lockout_after_five_failures(client: TestClient):
         "account": username, "password": "Student123", "client_type": "MOBILE"})
     assert locked.status_code == 423
     assert locked.json()["code"] == 100102
+
+
+def test_explicit_web_question_skips_document_retrieval():
+    from app.routers.chat import is_web_first_question
+
+    assert is_web_first_question("今天学校官网有什么最新优惠", True)
+    assert not is_web_first_question("校园卡丢失后怎么补办", True)
+    assert not is_web_first_question("今天学校官网有什么最新优惠", False)
 
 
 def test_user_can_download_visible_document(client: TestClient):
